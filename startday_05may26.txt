@@ -1,0 +1,229 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║         START-OF-DAY CHECKLIST  —  05 May 2026  (Tuesday)           ║
+║         Phase 15+17+18+19 verification day — first live v2 session   ║
+║         DhanOmniEngine v2  (27-thread Agentic + RAG)                ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+⚠ THIS IS AN AUDIT DAY. Phase 15 fixes from 2026-05-01 are unverified.
+  Goal today: run v2 a full session, then run audit_v2_runtime.py at EOD
+  and confirm the four expected outcomes (see STEP 11).
+
+  Background: Mon 04 May was skipped (user away). Last live session was
+  Apr 24 — that audit revealed three bugs which were fixed Phase 15.
+  Today is the first opportunity to verify the fixes work in production.
+
+  Phase 15 fixes recap:
+    1. OptionScalper / EMA_9_21 / Supertrend_MACD dedup tightened
+       (per-bar timestamp gate + time cooldown)
+    2. OrderPlacer kill switch now auto-resets after 30 min idle
+       + all status now goes through logger (was print())
+    3. PairLeadership now writes to strategy_signals (was invisible)
+
+  Phase 16 status:
+    Built but DISABLED. MultiStrikeScalpWorker is wired into v2 with
+    enabled=False. It will not fire today even if v2 is running. To
+    activate: backtest must pass all 3 gates (signals/day 2-10,
+    win-rate ≥ 55%, RR ≥ 1.8) — gated by richer option candle data
+    which doesn't exist yet. See PHASE16_PLAN.md.
+    Today's job is Phase 15 verification only — leave Phase 16 alone.
+
+Run ALL steps in order before market opens (9:15 IST).
+Target: complete by 9:00 IST so warmup candles accumulate from open.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Verify Python Environment
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run:
+    C:\ProgramData\anaconda3\python.exe --version
+    C:\ProgramData\anaconda3\python.exe -c "import dhanhq, chromadb, anthropic, flask; print('All core packages OK')"
+
+Expected: Python 3.x, "All core packages OK"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Verify API Keys
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+a) Dhan token — TOKEN EXPIRED as of 2026-05-04 18:34 IST.
+   *** MUST refresh before starting v2 today ***
+   1. Go to https://developer.dhan.co/home and generate a new token
+   2. Update .env (or config file) with the new token
+   3. Verify with:
+          C:\ProgramData\anaconda3\python.exe check_token.py
+   Expected output: "Token valid"
+
+b) Kite token (refreshes daily at midnight IST):
+       C:\ProgramData\anaconda3\python.exe refresh_kite_token.py
+
+c) Claude API key (for MetaAgent RAG+LLM mode):
+   File MasterConfiguration\config\claude_api_key.txt should start with
+   "sk-ant-api...". MetaAgent falls back to PASS-THROUGH if missing — OK
+   but suboptimal.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — DB Integrity + Pre-flight Checks
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run:
+    C:\ProgramData\anaconda3\python.exe day_start_checks.py
+
+Should show OK for: token, scrip master, open orders, strike lookup.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — Confirm Phase 15 Fixes Are In Place
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Quick visual check that the fixes from 2026-05-01 are still in the files:
+
+    C:\ProgramData\anaconda3\python.exe -c "
+import re
+for f in ['strategies/option_scalper.py','strategies/ema_9_21.py','strategies/supertrend_macd.py','core/order_placer.py','DhanOmniEngine.py']:
+    src = open(f, encoding='utf-8').read()
+    has_cooldown   = 'COOLDOWN_SECS' in src or '_FAILURE_RESET_SECS' in src
+    has_logger     = 'logger' in src or '_log_strategy_eval' in src
+    print(f'{f:40s}  cooldown={has_cooldown}  logger={has_logger}')"
+
+Expected: every file shows cooldown=True and logger=True.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — Incremental KB Update
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DhanNightlyLearn task should have run on Fri 02 May at 16:00 IST.
+Confirm:
+    schtasks /query /tn "DhanNightlyLearn" /v /fo LIST | findstr /i "Last Result"
+
+Manual catch-up if needed (covers 02-May + 04-May data if any):
+    C:\ProgramData\anaconda3\python.exe -m rag.nightly_learn --force
+
+KB baseline on 2026-05-01 was 94 docs. After two trading days it should
+be ~110-130 docs.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — Start the v2 Trading System
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Today's primary goal — run v2, NOT v1.
+
+    C:\ProgramData\anaconda3\python.exe DhanOmniEngine_v2.py
+
+Wait for the startup banner:
+    [v2] Initialising DhanOmniEngine backend...
+    [v2] Backend ready
+    [v2] KnowledgeBase ready — N trade outcomes
+    [v2] 22 strategy workers created          ← A through V (L disabled)
+    [v2] DataAgent wired: 22 subscriptions
+    [v2] All 27 agents started                ← Director+Data+22 workers+Meta+Exec+OCC
+    [v2] Phase-18 workers: Ichimoku(M) SMC(N) FibRetracement(O) StochRSIDiv(P) MACDHistDiv(Q)
+    [v2] Phase-19 workers: ElliotWave(R) Harmonic(S) CandleReversal(T) Donchian(U) MultiTFEMA(V)
+    [v2] MetaAgent mode: RAG+LLM       ← good
+                     or: PASS-THROUGH  ← OK if no Claude key
+    [v2] DirectorAgent mode: RAG+LLM   ← good (day thesis active)
+
+NOTE: If banner shows different counts, DO NOT proceed — check imports in
+      DhanOmniEngine_v2.py and strategy_worker.py for missing workers.
+
+Keep this terminal open, do NOT also start v1 (DhanOmniEngine.py) — they
+will both write to strategy_signals and pollute the audit.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — Start Dashboard + SL Monitor + TG Reader
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Open three more terminals:
+
+    Terminal 2:  C:\ProgramData\anaconda3\python.exe dhan_dashboard.py
+    Terminal 3:  C:\ProgramData\anaconda3\python.exe dhan_sl_monitor.py
+    Terminal 4:  C:\ProgramData\anaconda3\python.exe telegram_reader_production.py
+
+Open browser: http://127.0.0.1:5050 → Agents tab
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — Wait for Warmup (9:15 → 9:45 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+First real signals expected after 09:45. ORB needs 09:30. TriplePattern
+needs 14:15. OptionScalper needs ~12:45 (46 × 5m candles).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — Mid-Session Spot Check (around 12:00 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Quick sanity check that Phase 15 dedup fix is working:
+
+    C:\ProgramData\anaconda3\python.exe -c "
+import sqlite3
+from datetime import date
+conn = sqlite3.connect(r'C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\data\trading.db')
+c = conn.execute(\"SELECT strategy, COUNT(*) FROM strategy_signals WHERE DATE(ts)=? AND signal IN ('BULLISH','BEARISH') GROUP BY strategy\", (str(date.today()),))
+for r in c.fetchall(): print(r)"
+
+If OptionScalper count > 1000 by noon → dedup bug NOT fixed, investigate.
+Healthy mid-session count: ≤200 across all strategies combined.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 10 — End of Day (15:30 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+a) SL monitor auto-closes positions at 15:25 IST.
+b) Stop v2 (Ctrl+C in Terminal 1).
+c) DhanNightlyLearn auto-fires at 16:00 (incremental KB embed).
+d) DhanKBAudit fires at 16:30 — but cadence-gated; first real audit
+   is on 2026-05-15.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 11 — RUN PHASE 15 VERIFICATION AUDIT  ← THE WHOLE POINT OF TODAY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run after 16:00 IST (ensures whatif backtest data is in DB):
+
+    C:\ProgramData\anaconda3\python.exe audit_v2_runtime.py
+
+Output goes to:
+    MasterConfiguration\reports\v2_audit_2026-05-05.md
+
+EXPECTED OUTCOMES — all four MUST be true for Phase 15 to be confirmed:
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │  ✓ 1. Engine liveness shows ALIVE                              │
+  │       (last log line within 10 min of run, alive=15 dead=0)    │
+  │                                                                 │
+  │  ✓ 2. OptionScalper_EMA44 fires ≤ 375 non-NEUTRAL              │
+  │       (5 indices × 75 5m candles max; was 20,138 on Apr 24)    │
+  │                                                                 │
+  │  ✓ 3. PairLeadership row appears in funnel                     │
+  │       (was 0 on Apr 24 because _log_strategy_eval was missing) │
+  │                                                                 │
+  │  ✓ 4. At least 1 OmniEngine strategy_name in orders table      │
+  │       (i.e. NOT only "TG:SIGNAL"; was 0 on Apr 24)             │
+  └────────────────────────────────────────────────────────────────┘
+
+If sandbox API has outages today, also verify auto-recovery:
+    Look in v2 log for lines like:
+       [OrderPlacer] X min since last failure — resetting counter
+    These mean the kill switch self-healed (Phase 15 fix #2).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 12 — IF AUDIT PASSES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Update memory file:
+    C:\Users\meetm\.claude\projects\...\memory\session_TRD_20260416.md
+Mark Phase 15 as VERIFIED with date 2026-05-05.
+
+Move on to Phase 3b (MetaAgent decision feedback loop).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 12 — IF AUDIT FAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Capture for next debug session:
+  1. v2 log file — most recent dhan_omni_engine_v2_05May2026_*.log
+  2. Audit report — MasterConfiguration\reports\v2_audit_2026-05-05.md
+  3. stderr file — DhanOmniEngine_stderr_05May2026_*.log
+  4. Any "Order failed" or "Exception" lines from any of the three
+
+Likely culprits per failed outcome:
+  • #1 fails → DhanOmniEngine_v2.py crashed early; check stderr
+  • #2 fails → dedup not working; check option_scalper.py imports
+  • #3 fails → PairLeadership early-return; check len(RELIANCE)/len(HDFC)
+  • #4 fails → sandbox API stuck OR strike_lookup returning None
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — Phase 15 Files Touched
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+strategies/option_scalper.py     — two-stage dedup
+strategies/ema_9_21.py           — two-stage dedup
+strategies/supertrend_macd.py    — two-stage dedup
+core/order_placer.py             — logger + 30-min auto-reset
+DhanOmniEngine.py                — added _log_strategy_eval for PairLeadership
+audit_v2_runtime.py              — the audit script itself
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -1,0 +1,17 @@
+============================================================
+RUN THIS IN POWERSHELL AS ADMINISTRATOR
+(Right-click PowerShell -> Run as Administrator)
+============================================================
+
+COMMAND 1 - Firewall rule (LAN access on same WiFi):
+New-NetFirewallRule -DisplayName 'DhanDashboard-5050' -Direction Inbound -Protocol TCP -LocalPort 5050 -Action Allow -Profile Any
+
+COMMAND 2 - Auto-start tunnel at every Windows login:
+schtasks /Create /TN "DhanDashboardTunnel" /TR "C:\ProgramData\anaconda3\pythonw.exe C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\tunnel_manager.py" /SC ONLOGON /F
+
+============================================================
+After running both commands, the tunnel will:
+- Start automatically every time you log into Windows
+- Send the new URL to your Telegram within 30 seconds
+- Restart automatically if it crashes
+============================================================

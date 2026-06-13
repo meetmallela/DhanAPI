@@ -1,0 +1,667 @@
+"""
+DhanOmniEngine_v2.py
+--------------------
+Agentic + RAG trading engine — Phase 1, 2, 16 & Director.
+
+Architecture (38 threads total):
+  26 strategy workers (A–V + Y + Z + AA + AB) + 12 infrastructure daemons
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  DirectorAgent  (1 thread)                                   │
+  │  • Stage 1 at 09:00 IST: gap%, India VIX, 5-day trend       │
+  │    → Claude Haiku → DayThesis (BULLISH/BEARISH/NEUTRAL)      │
+  │  • Stage 2 at 09:20 IST: first-5-candle opening confirm     │
+  │  │ day_bias injected into every MarketSnapshot              │
+  └──────────────────────────────┬───────────────────────────────┘
+                                 ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  DataAgent  (1 thread)                                       │
+  │  • sync_data() every 10s  • regime detection (ADX)          │
+  │  │ attaches day_bias; publishes MarketSnapshot per index    │
+  │  └─────────────────┬────────────────────────────────────────┘
+  │                    │ fan-out to 22 worker inboxes
+  │   ┌────────────────┼──────── ... ──────────────────────┐
+  │   ▼                ▼                                    ▼
+  │  A–K (original)   L (disabled)   M–Q (Phase 18)      R–V (Phase 19)
+  │  EMA921..         MultiStrike    Ichimoku, SMC, Fib,  ElliotWave, Harmonic,
+  │  PairLeadership   Scalp          StochRSIDiv,         CandleReversal,
+  │                                  MACDHistDiv          Donchian, MultiTFEMA
+  │   │                │                                    │
+  │   └────────────────┼──────── ... ──────────────────────┘
+  │                    │ signal_queue (SignalEvent + day_bias)
+  │                    ▼
+  │  ┌─────────────────────────────────────────────────────────┐
+  │  │  MetaAgent  (1 thread)  — Phase 2 RAG                  │
+  │  │  • ChromaDB similarity search (past trades)            │
+  │  │  • Aligned signal → lower execute bar (WR ≥ 40 %)     │
+  │  │  • Contradicting signal → raise bar (WR ≥ 60 %)       │
+  │  └──────────────────┬──────────────────────────────────────┘
+  │                     │ approved_queue (filtered SignalEvents)
+  │                     ▼
+  │  ┌────────────────────────────────┐
+  │  │  ExecutionAgent  (1 thread)    │
+  │  │  engine.execute() -> order     │
+  │  └────────────────────────────────┘
+  │
+  │  OptionCandleCollector  (1 thread, Phase 16)
+  │  • Every 5 min fetches ATM-strip NIFTY option candles
+  │  • Saves to kite_candles.db for MultiStrikeScalp backtest
+  │
+  │  GammaBlastWorker  (1 thread, Phase 20)
+  │  • Polls Dhan API every 5 s for ATM NIFTY CE+PE LTP
+  │  • Scores gamma blast 0–9; fires BUY_STRADDLE at score ≥ 7
+  │  • Bypasses MetaAgent — time-sensitive 2–5 min trade
+  └──────────────────────────────────────────────────────────────┘
+
+Run:
+    python DhanOmniEngine_v2.py
+
+Set ANTHROPIC_API_KEY env var for MetaAgent filtering.
+Without it, MetaAgent runs in pass-through mode (all signals forwarded).
+"""
+
+import mysql_sqlite_bridge
+import atexit
+import os
+import queue
+import time
+import signal as _signal
+import sys
+import logging
+from pathlib import Path
+
+from master_resource import MasterResource
+from DhanOmniEngine import DhanOmniEngine, _is_market_open
+from expiry_calendar import morning_summary, expiry_indices_today, is_market_holiday
+
+from agents.data_agent              import DataAgent
+from agents.director_agent          import DirectorAgent
+from agents.meta_agent              import MetaAgent
+from agents.execution_agent         import ExecutionAgent
+from agents.option_candle_collector import OptionCandleCollector
+from agents.gamma_blast_worker      import GammaBlastWorker
+from agents.pcr_filter              import PCRFilter, init_instance as _pcr_init
+from agents.vix_straddle_worker     import VIXStraddleWorker
+from agents.iron_condor_worker      import IronCondorWorker
+from agents.weekly_strangle_worker  import WeeklyStrangleWorker
+from agents.red_day_seller_worker       import RedDaySellerWorker
+from agents.intraday_theta_worker       import IntradayThetaDecayWorker
+from agents.expiry_blast_worker         import ExpiryBlastWorker
+from agents.futures_basis_worker    import FuturesBasisWorker
+from agents.fundamental_agent       import FAAgent, ensure_fa_tables
+from agents.anomaly_scanner         import AnomalyScanner, ensure_anomaly_table
+from agents.risk_sentinel           import RiskSentinel, ensure_risk_table
+from agents.equity_candle_collector import EquityCandleCollector, ensure_equity_candle_table
+from agents.pattern_scanner         import PatternScanner, ensure_pattern_table
+from agents.pattern_alert_trader    import PatternAlertTrader, ensure_trader_column
+from agents.pa_scanner              import PAScanner, ensure_pa_tables
+from agents.commodity_brain         import (CommodityBrain, ensure_commodity_tables,
+                                            MCXWorker, init_instance as _mcx_init)
+from agents.mcx_candle_collector    import MCXCandleCollector, ensure_mcx_candle_table
+from core.mcx_option_candle_sweeper import MCXOptionCandleSweeper
+from agents.leading_indicator_engine import LeadingIndicatorEngine
+from core.leading_store              import ensure_leading_tables
+from core.watchdog_store             import ensure_table as _ensure_watchdog_table
+from agents.flag_breakout_worker    import FlagBreakoutWorker
+from agents.triangle_breakout_worker import TriangleBreakoutWorker
+from agents.hs_pattern_worker       import HSPatternWorker
+from agents.strategy_worker         import (PowerCandleWorker, ScalerV2Worker,
+                                            ConvergenceWorker, LongBuildupWorker, ShortCoveringWorker)
+from agents.futures_candle_collector import FuturesCandleCollector
+from agents.strategy_worker import (
+    EMA921Worker,
+    OptionScalperWorker,
+    SupertrendMACDWorker,
+    EMAVWAPSRWorker,
+    ORBVWAPWorker,
+    TriplePatternWorker,
+    IndexMomentumWorker,
+    BBMeanReversionWorker,
+    VWAPReclaimWorker,
+    CPRBreakoutWorker,
+    PairLeadershipWorker,
+    MultiStrikeScalpWorker,
+    IchimokuWorker,
+    SMCWorker,
+    FibRetracementWorker,
+    StochRSIDivWorker,
+    MACDHistDivWorker,
+    ElliotWaveWorker,
+    HarmonicWorker,
+    CandleReversalWorker,
+    DonchianBreakoutWorker,
+    MultiTFEMAWorker,
+    VWAPSlopeWorker,
+)
+from rag.knowledge_base import KnowledgeBase
+
+logger = MasterResource.setup_shared_logger("dhan_omni_engine_v2")
+
+HEALTH_CHECK_INTERVAL = 60
+
+
+def _acquire_lock() -> Path:
+    """Write a PID lockfile; abort if another live instance holds it.
+
+    Pass --force on the command line to override (kills the old instance).
+    Returns the lock path so the caller can register cleanup.
+    """
+    lock_path = Path(MasterResource.MASTER_ROOT) / "data" / "dhan_omni_engine.lock"
+    force     = "--force" in sys.argv
+
+    if lock_path.exists():
+        try:
+            old_pid = int(lock_path.read_text().strip())
+        except ValueError:
+            old_pid = None
+
+        alive = False
+        if old_pid:
+            try:
+                os.kill(old_pid, 0)   # signal 0 = existence check, no actual signal
+                # Verify PID is OmniEngine — check CommandLine for the script name.
+                # Checking Name alone ("python") causes false positives when the PID
+                # is reused by any other Python process (e.g. a new restart attempt).
+                import subprocess
+                result = subprocess.run(
+                    ["wmic", "process", "where", f"ProcessId={old_pid}",
+                     "get", "CommandLine,Name"],
+                    capture_output=True, text=True, timeout=3
+                )
+                output     = result.stdout.lower()
+                is_python  = "python" in output
+                is_omni    = "omniengine_v2" in output or "dhanomniengine_v2" in output
+                alive      = is_python and is_omni
+                if is_python and not is_omni:
+                    logger.warning(
+                        "[LOCK] PID %d is Python but NOT DhanOmniEngine_v2 "
+                        "(PID reused by another process) — clearing stale lock",
+                        old_pid,
+                    )
+                elif not is_python:
+                    logger.warning(
+                        "[LOCK] PID %d is not a Python process (PID reused) — clearing stale lock",
+                        old_pid,
+                    )
+            except (OSError, ProcessLookupError):
+                alive = False          # stale lock — PID no longer exists
+            except Exception:
+                alive = True           # wmic failed; be conservative, don't clobber
+
+        if alive:
+            if force:
+                logger.warning(
+                    "[LOCK] --force: killing old instance PID %d and taking over", old_pid
+                )
+                try:
+                    os.kill(old_pid, _signal.SIGTERM)
+                    time.sleep(2)
+                except Exception:
+                    pass
+            else:
+                logger.error(
+                    "[LOCK] Another DhanOmniEngine_v2 is already running (PID %d). "
+                    "Use --force to override, or kill PID %d first.",
+                    old_pid, old_pid,
+                )
+                sys.exit(1)
+        else:
+            logger.warning("[LOCK] Stale lockfile (PID %s not found) — removing and continuing", old_pid)
+
+    lock_path.write_text(str(os.getpid()))
+    logger.info("[LOCK] Lock acquired — PID %d → %s", os.getpid(), lock_path)
+
+    def _release():
+        try:
+            if lock_path.exists() and int(lock_path.read_text().strip()) == os.getpid():
+                lock_path.unlink()
+                logger.info("[LOCK] Lock released")
+        except Exception:
+            pass
+
+    atexit.register(_release)
+
+    # Also release on SIGTERM / SIGINT so Ctrl-C or taskkill /F cleans up
+    for _sig in (_signal.SIGTERM, _signal.SIGINT):
+        _orig = _signal.getsignal(_sig)
+        def _handler(signum, frame, _orig=_orig, _rel=_release):
+            _rel()
+            if callable(_orig):
+                _orig(signum, frame)
+            else:
+                sys.exit(0)
+        _signal.signal(_sig, _handler)
+
+    return lock_path
+
+
+def build_and_run(is_sandbox: bool = True):
+
+    # ── 0a. Single-instance guard — must be first ──────────────────────────
+    _acquire_lock()
+
+    # ── 1. Expiry calendar — log before anything else ──────────────────────
+    from datetime import date as _date
+    _cal_summary = morning_summary()
+    _exp_today   = expiry_indices_today()
+    _is_holiday  = is_market_holiday()
+    logger.info("[v2] ════════════════════════════════════════════")
+    logger.info("[v2] MARKET CALENDAR  %s", _date.today().strftime("%A %d-%b-%Y"))
+    logger.info("[v2] %s", _cal_summary)
+    if _is_holiday:
+        logger.warning("[v2] *** TODAY IS A MARKET HOLIDAY — engine will idle ***")
+    if _exp_today:
+        logger.info(
+            "[v2] *** EXPIRY DAY: %s — GammaBlast threshold lowered 14:00–15:25 ***",
+            " + ".join(_exp_today),
+        )
+    logger.info("[v2] ════════════════════════════════════════════")
+
+    # ── 2. Core engine — data + execution backend ──────────────────────────
+    logger.info("[v2] Initialising DhanOmniEngine backend...")
+    engine = DhanOmniEngine(is_sandbox=is_sandbox)
+    logger.info("[v2] Backend ready")
+
+    # ── 2. Queues ──────────────────────────────────────────────────────────
+    signal_queue:   queue.Queue = queue.Queue(maxsize=200)   # workers → MetaAgent
+    approved_queue: queue.Queue = queue.Queue(maxsize=200)   # MetaAgent → Execution
+
+    # ── 3. Knowledge base (ChromaDB) ───────────────────────────────────────
+    try:
+        kb = KnowledgeBase()
+        logger.info(f"[v2] KnowledgeBase ready — {kb.count()} trade outcomes")
+        if kb.count() == 0:
+            logger.warning(
+                "[v2] ChromaDB is empty. Run:  python -m rag.trade_embedder  "
+                "to seed it with historical trade outcomes."
+            )
+    except Exception as e:
+        logger.warning(f"[v2] KnowledgeBase unavailable ({e}) — MetaAgent will pass-through")
+        kb = None
+
+    # ── 4. Strategy workers (A–V, Y) ──────────────────────────────────────
+    # MultiStrikeScalp (L) is wired but DISABLED until backtest passes.
+    # W (VIXStraddle) and X (IronCondor) are daemon workers, not fan-out subscribers.
+    workers = [
+        EMA921Worker(signal_queue),           # A
+        OptionScalperWorker(signal_queue),    # B
+        SupertrendMACDWorker(signal_queue),   # C
+        EMAVWAPSRWorker(signal_queue),        # D
+        ORBVWAPWorker(signal_queue),          # E
+        TriplePatternWorker(signal_queue),    # F
+        IndexMomentumWorker(signal_queue),    # G
+        BBMeanReversionWorker(signal_queue),  # H
+        VWAPReclaimWorker(signal_queue),      # I
+        CPRBreakoutWorker(signal_queue, engine._compute_cpr),  # J
+        PairLeadershipWorker(signal_queue),   # K
+        MultiStrikeScalpWorker(signal_queue, enabled=False),   # L (disabled)
+        IchimokuWorker(signal_queue),         # M
+        SMCWorker(signal_queue),              # N
+        FibRetracementWorker(signal_queue),   # O
+        StochRSIDivWorker(signal_queue),      # P
+        MACDHistDivWorker(signal_queue),      # Q
+        ElliotWaveWorker(signal_queue),       # R
+        HarmonicWorker(signal_queue),         # S
+        CandleReversalWorker(signal_queue),   # T
+        DonchianBreakoutWorker(signal_queue), # U
+        MultiTFEMAWorker(signal_queue),       # V
+        VWAPSlopeWorker(signal_queue),        # Y  Phase-22: full 3-signal VWAP
+        FlagBreakoutWorker(signal_queue),     # Z  Phase-3B: flag/pennant breakout
+        TriangleBreakoutWorker(signal_queue), # AA Phase-3B: ascending/descending/symmetrical triangle
+        HSPatternWorker(signal_queue),        # AB Phase-3B: head & shoulders / inverse H&S
+        PowerCandleWorker(signal_queue),      # AC OBS: EMA44 power candle pullback (5m, trend)
+        ScalerV2Worker(signal_queue),         # AD OBS: EMA9 break + RSI 60/40 (1m, trend)
+        ConvergenceWorker(signal_queue, engine._compute_cpr),  # AE CEP: 3/4 macro convergence
+        LongBuildupWorker(signal_queue),                       # AF CEP: futures price↑+vol↑+OI↑
+        ShortCoveringWorker(signal_queue),                     # AG CEP: futures price↑+vol↑+OI↓
+    ]
+    logger.info(f"[v2] {len(workers)} strategy workers created (A–V + Y + Z + AA–AG)")
+
+    # ── 5. Director agent (day thesis) ────────────────────────────────────────
+    director = DirectorAgent()
+    logger.info("[v2] DirectorAgent created")
+
+    # ── 5b. PCR / Max Pain filter ─────────────────────────────────────────────
+    pcr_filter = PCRFilter()
+    _pcr_init(pcr_filter)   # register singleton for execute() max-pain gate
+    logger.info("[v2] PCRFilter created (fetches NSE OI at 09:20 IST)")
+
+    # ── 6. Data agent ──────────────────────────────────────────────────────
+    data_agent = DataAgent(engine, director=director, pcr_filter=pcr_filter)
+    for w in workers:
+        data_agent.subscribe(w.inbox)
+    logger.info(f"[v2] DataAgent wired: {len(workers)} subscriptions")
+
+    # ── 7. MetaAgent (RAG filter) ──────────────────────────────────────────
+    meta_agent = MetaAgent(
+        signal_queue   = signal_queue,
+        approved_queue = approved_queue,
+        knowledge_base = kb or KnowledgeBase.__new__(KnowledgeBase),
+    )
+
+    # ── 8. Execution agent ─────────────────────────────────────────────────
+    exec_agent = ExecutionAgent(engine, approved_queue)
+
+    # ── 9. Option candle collector (Phase 16) ──────────────────────────────
+    opt_collector = OptionCandleCollector()
+
+    # ── 9b. Gamma Blast Worker (Phase 20) ─────────────────────────────────
+    # Polls Dhan every 5s for ATM CE+PE LTP; scores gamma blast (0-10); fires at ≥7.
+    gamma_worker = GammaBlastWorker(engine)
+
+    # ── 9c. VIX Straddle Worker (Phase 22 — Worker W) ─────────────────────
+    # Buys NIFTY ATM straddle when 60-day AND 120-day VIX percentiles < 25.
+    # Fires at most once/day during 09:30–13:30. Bypasses MetaAgent.
+    vix_straddle = VIXStraddleWorker(engine)
+
+    # ── 9d. Iron Condor Worker (Phase 22 — Worker X) ──────────────────────
+    # Sells OTM iron condor Tue/Wed 09:20–10:30 when VIX pct60 > 75 + RANGING.
+    iron_condor = IronCondorWorker(engine)
+
+    # ── 9e. Weekly Strangle Worker (Phase 23 — Worker Z1) ─────────────────
+    # Enters NIFTY weekly strangle Thu 15:25 when VIX < 20; holds to next expiry.
+    # Monitors daily for 2× premium breach → close + reopen. Bypasses MetaAgent.
+    wkly_strangle = WeeklyStrangleWorker(engine)
+
+    # ── 9f. Red Day Seller Worker (Phase 23 — Worker Z2) ──────────────────
+    # Sells OTM NIFTY CE when market is red >0.5% + RSI<40 + price<EMA-21.
+    # Window: 11:00–13:00 IST. Target 50% profit, SL 2× premium. Bypasses MetaAgent.
+    red_day_seller = RedDaySellerWorker(engine)
+
+    # ── 9f2. Intraday Theta Decay Worker (OBS Bot — Worker Z3) ──────────────
+    # Sells ATM NIFTY straddle when Goldilocks zone: spot range ≤25pts + premium
+    # decay ≥6pts over 20 min + intrinsic ≤2pts. Entry cutoff 14:30, exit 15:25.
+    intraday_theta = IntradayThetaDecayWorker(engine)
+
+    # ── 9g. Futures Basis Worker (3C) ─────────────────────────────────────
+    # Tracks NF basis, OI delta, and top-10 constituent lead-lag.
+    # Emits BULLISH/BEARISH SignalEvent when 3+ heavyweights lead index by >0.3%.
+    futures_basis = FuturesBasisWorker(engine, signal_queue)
+
+    # ── 9h. Expiry Blast Worker (Phase 4A) ────────────────────────────────
+    # Monitors NIFTY 1M on expiry days; fires BUY ATM CE on 15:00 blast candle.
+    # Pattern: NiftyBlast1 (body>0.85, move>2.5xATR, RSI jump>15, BB%>1.0).
+    expiry_blast = ExpiryBlastWorker(engine)
+
+    # ── 9i. FA Agent (Phase 4B) ───────────────────────────────────────────
+    # Saturday 10:00: full universe FA score scan + add top-15 to paper portfolio.
+    # Weekday 16:30: price update (abs return, alpha vs NIFTY, drawdown).
+    # Self-correction: Pearson weight adjustment after 10+ closed positions.
+    ensure_fa_tables()
+    fa_agent = FAAgent()
+
+    # ── 9j. Anomaly Scanner (Phase 5A) ───────────────────────────────────
+    # Scans ~209 FnO stocks every 5 min during market hours.
+    # Detects price > 2% from prev_close or volume > 2× time-scaled baseline.
+    # Writes hits to anomaly_alerts table; visible on dashboard Anomalies tab.
+    # Nightly 18:00: refreshes yfinance baselines for all FnO symbols.
+    ensure_anomaly_table()
+    anomaly_scanner = AnomalyScanner(dhan_client=engine.client)
+
+    # ── 9k. Risk Sentinel (Phase 5B) ─────────────────────────────────────
+    # Polls Dhan positions every 5 min; flags non-FnO equity holdings.
+    # Auto-clears flags when position is closed. Dashboard Risk Flags panel.
+    ensure_risk_table()
+    risk_sentinel = RiskSentinel(dhan_client=engine.client)
+
+    # ── 9l. Equity Candle Collector (Phase 6C data pipeline) ─────────────
+    # Polls Dhan intraday_minute_data() for all 209 FnO equity stocks during
+    # market hours. Stores 1M OHLCV in equity_candles.db.
+    # Required by Phase 6C Candlestick Pattern Scanner (builds up history now).
+    ensure_equity_candle_table()
+    eq_candle_coll = EquityCandleCollector(dhan_client=engine.client)
+
+    # ── 9m. Pattern Scanner (Phase 6C) ────────────────────────────────────
+    # Scans 209 FnO equity stocks every 5 min for 31 candlestick patterns
+    # across 1M, 5M, 1H, 4H timeframes. Writes hits to pattern_alerts table.
+    # Uses equity_candles.db for 1M/5M; yfinance for 1H/4H.
+    ensure_pattern_table()
+    pat_scanner = PatternScanner()
+
+    # ── 9m-ii. Pattern Alert Trader ───────────────────────────────────────
+    # Monitors pattern_alerts for conf=3 signals; selects ATM/ITM/OTM strike
+    # based on DTE; places 1-lot stock option order via place_dhan_order().
+    ensure_trader_column()
+    pat_trader = PatternAlertTrader(dhan_client=engine.client)
+
+    # ── 9n. PA Scanner (Phase 6B) ─────────────────────────────────────────
+    # Scans 209 FnO equity stocks every 5 min for Price Action setups:
+    # structure (UPTREND/DOWNTREND/RANGING), BOS, ChoCH, Order Blocks, FVGs.
+    # Zone-touch + 5M confirmation (pin bar, engulfing, IB breakout).
+    # Writes zones → pa_zones; setups → pa_setups. Dashboard: PA Setups tab.
+    ensure_pa_tables()
+    pa_scanner_inst = PAScanner()
+
+    # ── 9o. MCX Commodity Brain (Phase 6A) ────────────────────────────────
+    # MCXWorker: polls DXY every 5 min (Stooq); guards EIA blackout windows.
+    # MCXCandleCollector: fetches 1M OHLCV for 5 MCX mini contracts via Dhan
+    #   (GOLDM, SILVERM, CRUDEOILM, NATURALGAS, COPPERM) during 09:00-23:30.
+    # CommodityBrain: EMA cross + SuperTrend + VWAP + ORB + DXY → score ≥ 3.
+    #   Writes signals → commodity_signals. Dashboard: Commodities tab.
+    ensure_commodity_tables()
+    ensure_mcx_candle_table()
+    mcx_guard        = MCXWorker()
+    _mcx_init(mcx_guard)   # register singleton so CommodityBrain.is_safe_to_trade() works
+    mcx_coll         = MCXCandleCollector(dhan_client=engine.client)
+    commodity_brain  = CommodityBrain()
+    mcx_opt_sweeper  = MCXOptionCandleSweeper()  # fetches 1M candles for open MCX option positions
+
+    # ── 9q. Futures Candle Collector (CEP Phase-2) ───────────────────────
+    # Refreshes candles_futures_1min/5min/15min every 5 min via Kite.
+    # Keeps LongBuildupWorker (AF) and ShortCoveringWorker (AG) data current.
+    fut_coll = FuturesCandleCollector()
+
+    # ── 9p. Leading Indicator Engine (Phase 7A) ───────────────────────────
+    # Scans NIFTY, BANKNIFTY, SENSEX every 60s during market hours.
+    # OBI from kite.quote() futures depth; VolDelta from 1M futures candles;
+    # PCR/GEX from OIChain (kite.instruments + kite.quote()).
+    # Writes leading_snapshots + leading_signals to trading.db.
+    ensure_leading_tables()
+    leading_engine = LeadingIndicatorEngine()
+
+    # Watchdog heartbeat table — created once, written by DataAgent + SLMonitor
+    _ensure_watchdog_table()
+
+    # ── 10. Start all threads ──────────────────────────────────────────────
+    all_threads = [director, pcr_filter, data_agent, *workers, meta_agent, exec_agent,
+                   opt_collector, gamma_worker, vix_straddle, iron_condor,
+                   wkly_strangle, red_day_seller, intraday_theta, futures_basis, expiry_blast,
+                   fa_agent, anomaly_scanner, risk_sentinel, eq_candle_coll,
+                   pat_scanner, pat_trader, pa_scanner_inst,
+                   mcx_guard, mcx_coll, commodity_brain, mcx_opt_sweeper,
+                   fut_coll, leading_engine]
+    for t in all_threads:
+        t.start()
+
+    logger.info(
+        f"[v2] All {len(all_threads)} agents started\n"
+        f"     DirectorAgent → day thesis (BULLISH/BEARISH/NEUTRAL)\n"
+        f"     DataAgent → {len(workers)} StrategyWorkers (A–V+Y+Z+AA–AD) → MetaAgent (RAG) → ExecutionAgent\n"
+        f"     Phase-18: Ichimoku(M) SMC(N) FibRetracement(O) StochRSIDiv(P) MACDHistDiv(Q)\n"
+        f"     Phase-19: ElliotWave(R) Harmonic(S) CandleReversal(T) Donchian(U) MultiTFEMA(V)\n"
+        f"     Phase-22 fan-out: VWAPSlope(Y) — slope+position+bandwidth 3-signal VWAP\n"
+        f"     Phase-3B fan-out: FlagBreakout(Z) TriangleBreakout(AA) HSPattern(AB)\n"
+        f"     OBS: PowerCandle(AC) — EMA44 pullback power-candle 5m | ScalerV2(AD) — EMA9 break RSI60/40 1m\n"
+        f"     CEP Phase-2: Convergence(AE) — EMA9/21+CPR+BB+PCR-delta+FutOI 3/4 macro confluence\n"
+        f"     CEP Phase-2: LongBuildup(AF) — futures price↑+vol↑+OI↑ (institutional longs)\n"
+        f"     CEP Phase-2: ShortCovering(AG) — futures price↑+vol↑+OI↓ (shorts bailing)\n"
+        f"     FuturesCandleCollector — refreshes futures 1m/5m/15m candles every 5 min (CEP)\n"
+        f"     Phase-22 daemon: VIXStraddle(W) — ATM straddle when VIX pct60+120 < 25\n"
+        f"     Phase-22 daemon: IronCondor(X) — OTM condor Tue/Wed when VIX pct60 > 75 + RANGING\n"
+        f"     Phase-23 daemon: WklyStrangle(Z1) — sell strangle Thu 15:25 VIX<20, hold 1 week\n"
+        f"     Phase-23 daemon: RedDaySeller(Z2) — sell OTM CE when market red>0.5%+RSI<40\n"
+        f"     OBS Bot daemon: ThetaDecay(Z3) — sell ATM straddle Goldilocks zone (range≤25+decay≥6)\n"
+        f"     FuturesBasis daemon (3C) — NF basis+OI+constituent lead-lag → signal_queue\n"
+        f"     GammaBlastWorker → polls Dhan every 5s → straddle at score>=7 (Phase 20)\n"
+        f"     ExpiryBlastWorker → NIFTY expiry days 14:40-15:03 → BUY CE on blast\n"
+        f"     FAAgent (4B) → Sat 10:00 scan + Weekday 16:30 update + self-correct weights\n"
+        f"     AnomalyScanner (5A) → FnO price/vol anomalies every 5 min; nightly baseline refresh\n"
+        f"     RiskSentinel (5B) → non-FnO position flags every 5 min\n"
+        f"     EquityCandleCollector (6C-data) → 1M OHLCV for 209 FnO stocks → equity_candles.db\n"
+        f"     PatternScanner (6C) → 31 patterns × 4 TFs × 209 stocks → pattern_alerts table\n"
+        f"     PAScanner (6B) → structure+BOS+ChoCH+OB+FVG → pa_zones + pa_setups tables\n"
+        f"     MCXWorker (6A) → DXY poll every 5m + EIA blackout guard\n"
+        f"     MCXCandleCollector (6A) → 1M OHLCV for 5 MCX minis → mcx_candles.db\n"
+        f"     CommodityBrain (6A) → EMA+ST+VWAP+ORB+DXY → commodity_signals table\n"
+        f"     MCXOptSweeper (6A) → 1M candles for open MCX option positions → mcx_candles.db\n"
+        f"     LeadingIndicatorEngine (7A) → OBI+VolDelta+PCR+GEX → leading_snapshots/signals\n"
+        f"     MetaAgent mode: {'RAG+LLM' if not meta_agent._passthrough else 'PASS-THROUGH'}\n"
+        f"     DirectorAgent mode: {'RAG+LLM' if not director._passthrough else 'PASS-THROUGH'}"
+    )
+
+    # ── 10. Graceful shutdown ──────────────────────────────────────────────
+    def _shutdown(signum, frame):
+        logger.info("[v2] Shutdown signal — stopping all agents...")
+        for t in [director, data_agent, meta_agent, exec_agent,
+                  opt_collector, gamma_worker, vix_straddle, iron_condor,
+                  wkly_strangle, red_day_seller, expiry_blast, *workers]:
+            t.stop()
+        # FAAgent is a plain daemon thread (no stop() method needed)
+        for t in [anomaly_scanner, risk_sentinel, eq_candle_coll, pat_scanner,
+                  pat_trader, pa_scanner_inst, mcx_coll, commodity_brain, leading_engine]:
+            t.stop()
+        time.sleep(2)
+        if meta_agent._total > 0:
+            stats = meta_agent.stats()
+            logger.info(
+                f"[v2] MetaAgent session stats: "
+                f"total={stats['total']} executed={stats['executed']} "
+                f"skipped={stats['skipped']} filter_rate={stats['filter_rate']}%"
+            )
+        occ_stats = opt_collector.stats()
+        logger.info(
+            f"[v2] OptionCandleCollector session: "
+            f"cycles={occ_stats['cycles']} candle_rows={occ_stats['candle_rows_saved']}"
+        )
+        gb_stats = gamma_worker.stats()
+        logger.info(
+            f"[v2] GammaBlastWorker session: "
+            f"cycles={gb_stats['cycles']} signals_fired={gb_stats['signals_fired']}"
+        )
+        vs_stats = vix_straddle.stats()
+        logger.info(
+            f"[v2] VIXStraddle session: "
+            f"cycles={vs_stats['cycles']} signals_fired={vs_stats['signals_fired']}"
+        )
+        ic_stats = iron_condor.stats()
+        logger.info(
+            f"[v2] IronCondor session: "
+            f"cycles={ic_stats['cycles']} signals_fired={ic_stats['signals_fired']}"
+        )
+        ws_stats = wkly_strangle.stats()
+        logger.info(
+            f"[v2] WeeklyStrangle session: "
+            f"cycles_entered={ws_stats['cycles_entered']} "
+            f"adjustments={ws_stats['adjustments']}"
+        )
+        rd_stats = red_day_seller.stats()
+        logger.info(
+            f"[v2] RedDaySeller session: "
+            f"cycles={rd_stats['cycles']} signals_fired={rd_stats['signals_fired']}"
+        )
+        td_stats = intraday_theta.stats()
+        logger.info(
+            f"[v2] ThetaDecay session: "
+            f"cycles={td_stats['cycles']} signals_fired={td_stats['signals_fired']}"
+        )
+        logger.info("[v2] Shutdown complete")
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGINT,  _shutdown)
+    _signal.signal(_signal.SIGTERM, _shutdown)
+
+    # ── 11. Health monitor (main thread) ────────────────────────────────────
+
+    def _strategy_counts_today() -> str:
+        """Return per-strategy non-NEUTRAL signal counts for today, sorted desc."""
+        try:
+            import sqlite3 as _sq
+            from datetime import date as _date
+            db   = MasterResource.get_trading_db_path()
+            today = _date.today().isoformat()
+            con  = _sq.connect(db, timeout=5)
+            rows = con.execute(
+                "SELECT strategy, COUNT(*) as n FROM strategy_signals "
+                "WHERE signal != 'NEUTRAL' AND date(ts) = ? "
+                "GROUP BY strategy ORDER BY n DESC",
+                (today,),
+            ).fetchall()
+            con.close()
+            if not rows:
+                return "none yet"
+            return "  ".join(f"{s}={n}" for s, n in rows)
+        except Exception:
+            return "unavailable"
+
+    def _capital_summary_today() -> str:
+        """Return capital deployed today: total and per open/closed breakdown."""
+        try:
+            import sqlite3 as _sq
+            from datetime import date as _date
+            db    = MasterResource.get_trading_db_path()
+            today = _date.today().isoformat()
+            con   = _sq.connect(db, timeout=5)
+            rows  = con.execute(
+                "SELECT status, actual_entry_price, entry_price, quantity "
+                "FROM orders WHERE date(created_at) = ?",
+                (today,),
+            ).fetchall()
+            con.close()
+            if not rows:
+                return "Rs 0 (0 trades)"
+            total = open_cap = closed_cap = 0
+            open_n = closed_n = 0
+            for status, aep, ep, qty in rows:
+                price = aep or ep or 0
+                cap   = price * (qty or 0)
+                total += cap
+                if (status or "").upper() == "OPEN":
+                    open_cap += cap
+                    open_n   += 1
+                else:
+                    closed_cap += cap
+                    closed_n   += 1
+            return (f"Rs {total:,.0f} total "
+                    f"({open_n} open=Rs {open_cap:,.0f} | "
+                    f"{closed_n} closed=Rs {closed_cap:,.0f})")
+        except Exception:
+            return "unavailable"
+
+    while True:
+        time.sleep(HEALTH_CHECK_INTERVAL)
+        alive   = [t.name for t in all_threads if t.is_alive()]
+        dead    = [t.name for t in all_threads if not t.is_alive()]
+        stats   = meta_agent.stats()
+
+        occ     = opt_collector.stats()
+        gb      = gamma_worker.stats()
+        vs      = vix_straddle.stats()
+        ic      = iron_condor.stats()
+        ws      = wkly_strangle.stats()
+        rd      = red_day_seller.stats()
+        td      = intraday_theta.stats()
+        thesis  = director.thesis
+        dir_str = thesis.summary() if thesis else "pending"
+        logger.info(
+            f"[v2] Health | alive={len(alive)} dead={len(dead)} | "
+            f"signal_q={signal_queue.qsize()} approved_q={approved_queue.qsize()} | "
+            f"Director: {dir_str} | "
+            f"MetaAgent: total={stats['total']} executed={stats['executed']} "
+            f"skipped={stats['skipped']} ({stats['filter_rate']}% filtered) | "
+            f"Strategies today: {_strategy_counts_today()} | "
+            f"Capital today: {_capital_summary_today()} | "
+            f"OCC: cycles={occ['cycles']} rows={occ['candle_rows_saved']} | "
+            f"GammaBlast: cycles={gb['cycles']} fired={gb['signals_fired']} | "
+            f"VIXStraddle: cycles={vs['cycles']} fired={vs['signals_fired']} | "
+            f"IronCondor: cycles={ic['cycles']} fired={ic['signals_fired']} | "
+            f"WklyStrangle: entered={ws['cycles_entered']} adj={ws['adjustments']} | "
+            f"RedDaySeller: cycles={rd['cycles']} fired={rd['signals_fired']} | "
+            f"ThetaDecay: cycles={td['cycles']} fired={td['signals_fired']} | "
+            f"market={'OPEN' if _is_market_open() else 'CLOSED'}"
+        )
+        if dead:
+            logger.warning(f"[v2] Dead threads: {dead}")
+
+
+if __name__ == "__main__":
+    build_and_run(is_sandbox=True)

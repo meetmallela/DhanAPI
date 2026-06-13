@@ -1,0 +1,19 @@
+I have updated our core/dhan_client.py script to connect to the Sandbox environment by default, since you are testing with a developer account.
+
+
+  Summary: Where to Find the Sandbox Client ID
+   1. Log into developer.dhanhq.co.
+   2. Go to My Apps (or the Sandbox section).
+   3. Open your application "MyDhanBot".
+   4. The Client ID will be listed there alongside the Access Token. (Often, the Sandbox Client ID is simply the 10-digit mobile number you used to sign up for the developer portal).
+
+
+  Once you have both the Client ID and the Access Token, you can update the .env file in our workspace (located at C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\.env):
+
+   1 DHAN_CLIENT_ID="1234567890"  # Replace with your actual Client ID (or mobile number)
+   2 DHAN_ACCESS_TOKEN="your_long_access_token_here"
+
+
+  Let me know once you've updated the .env file, and I will write a quick test script to verify that our connection to your "MyDhanBot" application is working successfully!
+
+7067652505

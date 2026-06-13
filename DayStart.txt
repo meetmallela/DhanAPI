@@ -1,0 +1,754 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║            DHAN TRADING SYSTEM — DAILY STARTUP GUIDE                        ║
+║            Updated: April 2026  |  Python: C:\ProgramData\anaconda3\        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+This guide starts ALL bots in the correct order.
+Read every section fully before touching the keyboard.
+
+All commands use the full Python path to avoid "python not found" errors:
+  C:\ProgramData\anaconda3\python.exe
+
+Working directory for every command:
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 0 — ONE-TIME FIX (do this ONCE if you haven't already)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  YOUR .env FILE HAS A CLIENT ID MISMATCH
+    .env says:   DHAN_CLIENT_ID="7067652505"
+    Your token is issued for CLIENT ID: 2604048537
+    These must match or every API call will fail with "Invalid Token".
+
+FIX:
+  1. Open:  C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\.env
+  2. Change the file to exactly this:
+
+        DHAN_CLIENT_ID="2604048537"
+        DHAN_ACCESS_TOKEN="eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9....(your full token)"
+
+  3. Save the file.
+
+  Your current token is valid until: 2026-05-04 18:34 IST
+  (No daily refresh needed until that date)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — HOW TO GET A NEW TOKEN (when your token expires)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Dhan sandbox tokens are long-lived (weeks/months), NOT daily.
+You only need a new token when the old one stops working.
+
+STEPS TO GET A NEW TOKEN:
+  1. Go to:  https://developer.dhan.co/home
+  2. Log in with your developer account credentials.
+  3. Click "My Apps" → open your app "MyDhanBot" (or similar).
+  4. You will see:
+       Client ID:    [your 10-digit number]
+       Access Token: [long JWT string starting with eyJ...]
+  5. Copy BOTH values.
+  6. Open:  C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\.env
+  7. Paste them in:
+       DHAN_CLIENT_ID="<your client id>"
+       DHAN_ACCESS_TOKEN="<your full token>"
+  8. Save and close.
+
+VERIFY THE NEW TOKEN WORKS:
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  C:\ProgramData\anaconda3\python.exe check_token.py
+
+  Expected output:  OK  Token is valid  (with balance shown)
+  If you see FAILED: re-check your .env values against developer.dhan.co
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — PRE-MARKET CHECKLIST (run before 9:00 AM every day)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Open ONE terminal and run all checks with a single command:
+
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  C:\ProgramData\anaconda3\python.exe day_start_checks.py
+
+  This runs all 4 checks in sequence and prints OK / WARNING / FAILED for each.
+  If everything shows OK — proceed to Section 3.
+
+── Run individual checks if you need to investigate a specific area ─────────
+
+  Token valid?
+    C:\ProgramData\anaconda3\python.exe check_token.py
+
+  Scrip master (options data) present and fresh?
+    C:\ProgramData\anaconda3\python.exe check_scrip_master.py
+
+  Any leftover OPEN orders from yesterday?
+    C:\ProgramData\anaconda3\python.exe check_open_orders.py
+
+  Strike lookup working? (resolves NIFTY/BANKNIFTY ATM options)
+    C:\ProgramData\anaconda3\python.exe check_strike_lookup.py
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — EXECUTION SEQUENCE (open 5 separate terminal windows)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Start these IN ORDER. Wait for each "Ready" message before opening the next.
+
+All terminals — set working directory first:
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+
+─────────────────────────────────────────────────────────────────────────────
+TERMINAL 1 — Dashboard  (start FIRST — monitor everything here)
+─────────────────────────────────────────────────────────────────────────────
+
+  C:\ProgramData\anaconda3\python.exe dhan_dashboard.py
+
+  Ready when you see:
+    * Running on http://127.0.0.1:5050
+
+  Open http://127.0.0.1:5050 in your browser.
+  Balance and fund details populate within 10 seconds.
+  Keep this tab open all day — it auto-refreshes every 10 seconds.
+
+  What to check on first load:
+    Available Balance shows a number (not —)
+    Mode badge shows SANDBOX (yellow) or LIVE (green)
+    No red error banner at the top
+
+─────────────────────────────────────────────────────────────────────────────
+TERMINAL 2 — SL Monitor  (start SECOND — must be running before orders)
+─────────────────────────────────────────────────────────────────────────────
+
+  C:\ProgramData\anaconda3\python.exe dhan_sl_monitor.py
+
+  Ready when you see:
+    DhanSLMonitor initialized (sandbox=True)
+    LTPFeed: background thread started
+    SL Monitor: starting polling loop
+
+  What this process does:
+    Watches ALL open orders in the DB every 5 seconds
+    Connects to Dhan WebSocket for real-time LTP on your open options
+    Trails your stop-loss automatically through 3 stages:
+      Stage 1 (gain >= 3%)  : moves SL to breakeven
+      Stage 2 (gain >= 6%)  : locks in 50% of profit
+      Stage 3 (gain >= 9%)  : tight trail at peak x (1 - step%)
+    Forces exit of ALL positions at 15:25 IST regardless
+
+  If you see "DH-907 Data Error" — normal for sandbox WebSocket.
+  The bot falls back to REST polling automatically.
+
+─────────────────────────────────────────────────────────────────────────────
+TERMINAL 3 — Order Placer  (picks up signals and executes them)
+─────────────────────────────────────────────────────────────────────────────
+
+  C:\ProgramData\anaconda3\python.exe dhan_order_placer.py
+
+  Ready when you see:
+    Dhan Order Placer Initialized (Sandbox=True)
+    Starting Polling loop for 'signals' table...
+
+  What this process does:
+    Polls the signals DB every 2 seconds for unprocessed signals
+    Resolves the real ATM option security_id via StrikeLookup
+      (no more hardcoded Reliance proxy — uses live scrip master)
+    Places the order on Dhan (MARKET, INTRADAY)
+    Writes the order to the orders table with security_id, exchange_segment,
+      and tradingsymbol so the SL Monitor picks it up immediately
+
+─────────────────────────────────────────────────────────────────────────────
+TERMINAL 4 — Omni Strategy Engine  (automated signal generation)
+─────────────────────────────────────────────────────────────────────────────
+
+  C:\ProgramData\anaconda3\python.exe DhanOmniEngine.py
+
+  Ready when you see:
+    Dhan Omni Engine v2.0 - Real market data feed active.
+    Starting Omni-Strategy polling loop...
+
+  5 strategies running in parallel for NIFTY / BANKNIFTY / FINNIFTY / SENSEX:
+    EMA 9/21 Crossover
+    Pair Leadership (Reliance + HDFC)
+    Option Scalper EMA 44 (MTF)
+    Supertrend + MACD
+    Advanced EMA + ORB/VWAP
+
+  When a signal fires, the engine:
+    Resolves the ATM option security_id via StrikeLookup
+    Places a MARKET order on Dhan
+    Writes to BOTH the signals table and the orders table
+      so the SL Monitor starts tracking it immediately
+
+  Sandbox data note:
+    Intraday chart endpoint returns DH-907 (no data) outside market hours.
+    Strategies fire only when >= 30 candles are available.
+    This is normal — works fine from 9:20 AM onwards.
+
+─────────────────────────────────────────────────────────────────────────────
+TERMINAL 5 — Telegram Signal Bridge  (optional)
+─────────────────────────────────────────────────────────────────────────────
+
+  C:\ProgramData\anaconda3\python.exe dhan_tg_trader.py
+
+  Ready when you see:
+    Telegram Client Connected.
+    Listening for signals on Telegram...
+
+  First-time only: Telegram will ask for an OTP sent to your phone.
+  Type it in the terminal when prompted.
+  A session file "dhan_bot_session.session" is saved — no OTP on future runs.
+
+  What this process does:
+    Listens to all Telegram channels your account is in
+    Parses option buy signals (Yaatra format + channel-specific parsers)
+    Writes parsed signals to the DB for Terminal 3 to execute
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — VERIFY EVERYTHING IS WORKING  (9:15 AM — market open)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+On the Dashboard (http://127.0.0.1:5050):
+  Green pulsing dot in top-right corner
+  "Updated: HH:MM:SS" timestamp ticks every 10 seconds
+  Available Balance shows a real number
+  No red error banner
+
+In Terminal 4 (Omni Engine) after 9:20 AM:
+  Should print:
+    Fetched 30 candles for NIFTY 5m
+    Fetched 20 candles for NIFTY 15m
+  If you only see "Not enough 5m data yet" — wait a few minutes. Normal
+  during the first 5-10 minutes after market open.
+
+TO SIMULATE A TEST SIGNAL (verify the full pipeline end-to-end):
+  Open a 6th terminal:
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  C:\ProgramData\anaconda3\python.exe simulate_signal.py
+
+  Watch Terminal 3 (Order Placer) — you should see:
+    Processing Signal ID X: BUY NIFTY
+  Watch the Dashboard Orders tab — the new order should appear within 10s.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — WHAT TO WATCH DURING MARKET HOURS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DASHBOARD (http://127.0.0.1:5050):
+  Positions tab  — live P&L on each open option trade
+  Orders tab     — yellow = pending, green = executed, red = rejected
+  Trade Book tab — every fill with exact trade price
+  Funds tab      — margin consumed (watch this doesn't go negative)
+
+TERMINAL 2 (SL Monitor) — watch for:
+  New position tracked  — SL monitor picked up a new order from the DB
+  SL HIT                — stop loss triggered, position closed
+  EXIT [CUTOFF]         — 15:25 forced square-off
+
+TERMINAL 4 (Omni Engine) — watch for:
+  [SIGNAL] EMA_9_21 -> BUY NIFTY   — a crossover fired
+  Strike lookup OK                  — ATM option resolved successfully
+
+LOG FILES (for deeper review after market close):
+  C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\logs\
+    dhan_omni_engine_YYYYMMDD.log
+    dhan_sl_monitor_YYYYMMDD.log
+    dhan_order_placer_YYYYMMDD.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — SHUTDOWN  (15:30 IST or whenever you want to stop)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The SL Monitor auto-squares off ALL positions at 15:25 IST.
+If you want to exit manually before that, use the Dhan app or portal.
+
+Stop order (Ctrl+C in each terminal):
+  T5 Telegram  →  T4 Omni Engine  →  T3 Order Placer  →  T2 SL Monitor  →  T1 Dashboard
+
+Stop T2 (SL Monitor) LAST — it must stay alive until all positions are flat.
+T1 (Dashboard) is read-only and can be left running or closed at any time.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — QUICK TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PROBLEM                        CAUSE & FIX
+─────────────────────────────────────────────────────────────────────────────
+"Invalid Token"                .env has wrong Client ID or expired token.
+                               Fix: DHAN_CLIENT_ID="2604048537"
+                               See Section 0 and Section 1.
+
+"DH-907 Data Error"            Sandbox has no candle data outside market hours.
+                               Expected before 9:15 AM — ignore it.
+
+IndentationError or            Never paste multi-line Python into the command
+SyntaxError when running       prompt. Use the .py script files instead:
+a -c "..." command               check_token.py, check_strike_lookup.py, etc.
+
+"No module named X"            Not in the correct directory.
+                               Fix: cd C:\Users\meetm\OneDrive\Desktop\
+                                        GCPPythonCode\DhanAPI
+                               Then retry with C:\ProgramData\anaconda3\python.exe
+
+Dashboard shows — for          Poller hasn't run yet. Wait 10 seconds.
+all values                     If still — after 30s: check Terminal 1 for errors.
+
+Strike lookup returns None     No upcoming expiry in scrip master for that symbol.
+                               Fix: check internet, then run check_scrip_master.py
+
+Order Placer not executing     Signals table: processed must be 0.
+Telegram signals               Test: C:\ProgramData\anaconda3\python.exe simulate_signal.py
+
+SL Monitor not tracking        Order in DB is missing security_id AND tradingsymbol.
+a position                     Happens with orders placed before April 2026.
+                               Fix: close those orders on the Dhan portal manually.
+
+"database is locked"           Another process is holding the SQLite DB.
+                               Wait 30 seconds — WAL mode auto-resolves it.
+
+Telegram asks for OTP          Normal on first run. Enter the OTP from your phone.
+every time                     If it asks every time: delete dhan_bot_session.session
+                               and re-enter once to create a fresh session file.
+
+─────────────────────────────────────────────────────────────────────────────
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8 — KEY FILE LOCATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CREDENTIALS
+  .env                C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\.env
+                      Contains DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN
+
+DATABASES
+  Signals + Orders    C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\data\trading.db
+  Dashboard cache     C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\dhan_dashboard.db
+
+OPTIONS DATA
+  Scrip Master CSV    C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\data\dhan_scrip_master.csv
+                      Auto-refreshed every 8 hours from Dhan CDN
+
+CONFIGURATION
+  SL Config           C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\config\sl_config.json
+  Telegram Config     C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\config\telegram_config.json
+
+LOGS (today's)
+  All logs            C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\logs\
+
+CHECK SCRIPTS (new — use these instead of inline -c commands)
+  day_start_checks.py     Run all 4 checks in one go (use this every morning)
+  check_token.py          Token valid? Shows balance + margin
+  check_scrip_master.py   Scrip master present and fresh?
+  check_open_orders.py    Any leftover OPEN orders from yesterday?
+  check_strike_lookup.py  Strike lookup working for NIFTY/BANKNIFTY/FINNIFTY?
+
+DASHBOARD
+  URL                 http://127.0.0.1:5050
+  (only works while Terminal 1 is running)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — MORNING CHECKLIST AT A GLANCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+
+  STEP 1 — Pre-market checks (before 9:00 AM):
+    C:\ProgramData\anaconda3\python.exe day_start_checks.py
+
+  STEP 2 — Start bots in order (each in its own terminal window):
+    T1  C:\ProgramData\anaconda3\python.exe dhan_dashboard.py
+    T2  C:\ProgramData\anaconda3\python.exe dhan_sl_monitor.py
+    T3  C:\ProgramData\anaconda3\python.exe dhan_order_placer.py
+    T4  C:\ProgramData\anaconda3\python.exe DhanOmniEngine.py
+    T5  C:\ProgramData\anaconda3\python.exe dhan_tg_trader.py   (optional)
+
+  STEP 3 — Open dashboard in browser:
+    http://127.0.0.1:5050
+
+  STEP 4 — At 15:30 IST, stop in reverse order:
+    Ctrl+C in T5 → T4 → T3 → T2 → T1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+
+
+ Good. Since tomorrow (April 15) is the first trading day after the long weekend + holiday, here's the clean startup sequence to run before 9:15 AM IST tomorrow:
+
+  ---
+  Step 1 — Verify token is alive (run first)
+  C:\ProgramData\anaconda3\python.exe day_start_checks.py                                                                                                                                                   Should say Token check: OK. If not, refresh token on developer.dhan.co first.
+                                                                                                                                                                                                            ---
+  Step 2 — Start bots in this order (each in a separate terminal)
+
+  Terminal 1 — Telegram Reader (start first, so no signals are missed)
+  C:\ProgramData\anaconda3\python.exe telegram_reader_production.py
+
+  Terminal 2 — OmniEngine (market data + strategy signals)
+  C:\ProgramData\anaconda3\python.exe DhanOmniEngine.py
+
+  Terminal 3 — SL Monitor (only needed if OmniEngine places orders)
+  C:\ProgramData\anaconda3\python.exe dhan_sl_monitor.py
+
+  Terminal 4 — Dashboard (optional, for monitoring)
+  C:\ProgramData\anaconda3\python.exe dhan_dashboard.py
+
+  ---
+  What to watch for at 9:15 AM:
+
+  In the OmniEngine terminal you should now see lines like:
+  Fetched 26 bars for NIFTY 5m
+  Fetched 10 bars for NIFTY 15m
+  instead of the weekend error. That confirms the fix is working.
+
+  In the Telegram reader terminal, messages from your channels will start flowing in immediately.
+
+> will continue later                                                                                                                                                                                     
+● Sure, see you tomorrow! Good luck with the first trading day. 🎯
+
+
+● Open 4 separate terminal windows and run one command in each:
+
+  ---                                                                                                                                                                                                       Terminal 1 — Telegram Reader (start first)
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI                                                                                                                                                  C:\ProgramData\anaconda3\python.exe telegram_reader_production.py
+
+  Terminal 2 — OmniEngine (main strategy engine)
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  C:\ProgramData\anaconda3\python.exe DhanOmniEngine.py
+
+  Terminal 3 — SL Monitor
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  C:\ProgramData\anaconda3\python.exe dhan_sl_monitor.py
+
+  Terminal 4 — Dashboard (open browser at http://localhost:5000 after starting)
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  C:\ProgramData\anaconda3\python.exe dhan_dashboard.py
+
+  ---
+  What to look for after starting:
+
+  In Terminal 2 (OmniEngine), you should see:
+  NSE Live Feed started — using NSE prices for strategy signals
+  Then from 9:15 AM onward every ~60s:
+  NSE candles: {'NIFTY_5m': 3, 'BANKNIFTY_5m': 3 ...}
+  Numbers grow every 5 minutes. Once you see 5m: 30+ candles, strategies are active.
+
+  ---
+  Quick tip — save these as batch files so you don't retype each day:
+
+  Run this once to create them:
+  C:\ProgramData\anaconda3\python.exe day_start_checks.py
+  If it says all OK, start the 4 terminals above.
+  
+  ● Done. Here's the full picture now:
+
+  ---                                                                                                                                                                                                       Complete System — 4 Components
+                                                                                                                                                                                                            Telegram Channel
+        │
+        ▼
+  ① telegram_reader_production.py
+        │  writes to signals table (processed=0)
+        ▼
+  ② order_placer_dhan_sandbox.py  (polls every 5s)
+        │  places paper trade on Dhan Sandbox
+        │  writes to orders table (status=OPEN)
+        ▼
+  ③ dhan_sl_monitor.py  (polls every 5s)
+        │  watches orders table for OPEN positions
+        │  tracks LTP via Dhan WebSocket
+        │  trails SL, exits at 15:25
+        ▼
+  ④ dhan_dashboard.py  → http://127.0.0.1:5050
+        Shows: Positions | Orders | Trades | Funds
+               TG Signals tab (new) | Paper Trades tab (new)
+
+  ---
+  To start everything at once
+
+  Double-click start_trading_system.bat — it opens all 4 in separate windows.
+
+  Or manually, 4 terminals:
+  python telegram_reader_production.py
+  python order_placer_dhan_sandbox.py
+  python dhan_sl_monitor.py
+  python dhan_dashboard.py
+
+  Then open http://127.0.0.1:5050 — click "TG Signals" tab to see parsed signals and "Paper Trades" tab to see all sandbox orders with P&L.
+=====================
+
+Done. Stop what's currently running first, then use the new launcher:
+
+  Stop current bots:                                                                                                                                                                                        python start_trading_system.py stop
+                                                                                                                                                                                                            Start all in background:
+  python start_trading_system.py start
+  → 5 processes start silently, no windows, all logging to files
+
+  Check if they're alive anytime:
+  python start_trading_system.py status
+  Output:
+  =====================================================
+    TRADING SYSTEM STATUS  (started 2026-04-16 09:15)
+  =====================================================
+    ●  TG Reader        PID=12345  RUNNING
+    ●  Order Placer     PID=12346  RUNNING
+    ●  SL Monitor       PID=12347  RUNNING
+    ●  OmniEngine       PID=12348  RUNNING
+    ●  Dashboard        PID=12349  RUNNING
+  =====================================================
+
+  Stop everything:
+  python start_trading_system.py stop
+
+  The .bat file still works the same way — double-click it to start, and it now just calls the Python launcher. The dashboard at http://127.0.0.1:5050 is the only window you need open.
+  
+  
+  
+  
+(base) C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DeltaExchange>.\restart_all_delta.bat
+Starting Delta Exchange Multi-Agent Bot...
+cd c:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DeltaExchange
+launch_background.bat
+
+launch_background.bat
+
+Restart Bots: After checking keys, run stop_background.bat and then launch_background.bat again.
+
+Check .env: Verify your DELTA_API_KEY and DELTA_SECRET.
+Restart Bots: After checking keys, run stop_background.bat and then launch_background.bat again.
+Run Verification: Use C:\ProgramData\anaconda3\python.exe scratch_verify_status.py to confirm the keys are finally working.
+
+
+1. ⚠️ The Global Kill Switch
+I have programmed a new Kill Switch directly into the Delta Command Center.
+
+Location: In the top right corner, next to the syncing header status, there is now a red "⚠️ KILL SWITCH" button.
+Functionality: When clicked (and confirmed), it connects to the new /api/kill-switch backend endpoint. The server will rapidly fetch a list of all your active options and futures positions, and immediately dispatch closing market_order instructions to Delta Exchange to liquidate the entire portfolio at once.
+Feedback: An alert box will notify you of exactly how many open positions were successfully liquidated.
+2. 🥷 Background Processing
+To keep your Windows taskbar completely clean of open terminal windows, I've created two new control scripts in your bot's folder:
+
+launch_background.bat: This script loads your Anaconda environment and leverages pythonw.exe (Python's native windowless execution tool). It launches the Multi-Agent Bot, the Telegram Scraper, and the Dashboard entirely in the background. No consoles will appear.
+stop_background.bat: Since background instances are completely invisible to you (hidden from the taskbar), I created this "stop" script out of necessity. If you double-click this, it will safely and instantly wipe out any hidden background Python bots.
+Action Taken: I have already terminated the loud terminal tabs and successfully executed launch_background.bat.
+
+Your bots and scraping nodes are currently running completely out of sight! You can access the Command Center at http://localhost:8080/ to test the new visual Kill Switch and verify everything is syncing.
+
+
+
+After your Windows PC restarts, you only need to run one file to bring the entire system back up (the bots, the Telegram scraper, and the dashboard).
+
+Here are the exact steps to follow once you log back into Windows:
+
+Open your DeltaExchange folder located on your desktop: Desktop\GCPPythonCode\DeltaExchange
+
+cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DeltaExchange
+launch_background.bat
+
+Look for the file named launch_background.bat and double-click it.
+A black box will appear for a few seconds to boot up the Anaconda environment and launch all the modules silently in the background, and then it will close itself automatically.
+Once it closes, open your web browser and go to the Command Center URL: http://localhost:8080
+That's it! Everything will run continuously in the background. (If you ever need to turn everything off, you simply double-click the stop_background.bat file in that same folder).
+
+
+Memory file written. Session ID TRD-20260416 is fully stored.
+
+  To relaunch after restart:                                                                                                                                                                              
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI  
+  python start_trading_system.py start
+
+
+ Tomorrow morning, run this instead of just start:
+  python start_trading_system.py watchdog
+  
+  
+  Then check status:
+  python start_trading_system.py status
+
+  Open dashboard: http://127.0.0.1:5050 → Engines tab → all 5 should show green dots.
+
+  Expected on first launch today:
+  - OmniEngine strategies won't fire until ~11:45 AM (needs 30 candles from 9:15 AM start)
+  - SENSEX signals → SANDBOX_RECORDED (expected, Dhan limitation)
+  - MCX signals → skipped (expected)
+  - 2 TG channels will show connect errors (not a member — normal)
+
+✻ Sautéed for 3m 13s
+
+● Your memory is already persisted — it's saved to files on your disk, not tied to a browser session. Every new Claude Code conversation automatically loads it.
+
+  To get back with full context:                                                                                                                                                                          
+  1. Open Claude Code (terminal or desktop app)                                                                                                                                                             2. Navigate to your project:
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  3. Start a new conversation — Claude will auto-load your memory files from:
+  C:\Users\meetm\.claude\projects\...\memory\
+
+  You don't need the same session ID. Just mention TRD-20260416 if you want me to reference what was built this session, or just describe what you need — I'll have your profile, project state, and
+  preferences loaded automatically.
+
+  What gets remembered across sessions:
+  - Your Dhan demo account setup
+  - All 5 components and their architecture
+  - Preferences (sandbox only, background mode, no Zerodha)
+  - Known issues and limitations
+
+
+ You can also hit the URLs directly in your browser anytime:
+  - http://127.0.0.1:5050/download/signals — today's signals
+  - http://127.0.0.1:5050/download/signals?date=2026-04-16 — specific date
+  - http://127.0.0.1:5050/download/whatif?date=2026-04-16 — what-if for a date
+  
+  
+  Session ses_25f7189dbffeRe0cGHrMNUk6em saved (local memory/tools/files intact).
+
+Resume:
+
+kilo "continue ses_25f7189dbffeRe0cGHrMNUk6em"
+# or
+kilo "resume refactor bots"
+Close safe — pick up exactly (todos/phases/ML model). Night! 🚀
+
+Microsoft Windows [Version 10.0.19045.6466]
+(c) Microsoft Corporation. All rights reserved.
+
+C:\Users\meetm>ollama
+Usage:
+  ollama [flags]
+  ollama [command]
+
+Available Commands:
+  serve       Start ollama
+  create      Create a model
+  show        Show information for a model
+  run         Run a model
+  stop        Stop a running model
+  pull        Pull a model from a registry
+  push        Push a model to a registry
+  signin      Sign in to ollama.com
+  signout     Sign out from ollama.com
+  list        List models
+  ps          List running models
+  cp          Copy a model
+  rm          Remove a model
+  help        Help about any command
+
+Flags:
+  -h, --help      help for ollama
+  -v, --version   Show version information
+
+Use "ollama [command] --help" for more information about a command.
+
+C:\Users\meetm>ollama list
+NAME              ID              SIZE      MODIFIED
+mistral:latest    6577803aa9a0    4.4 GB    4 months ago
+llama2:latest     78e26419b446    3.8 GB    4 months ago
+phi:latest        e2fd6321a5fe    1.6 GB    4 months ago
+
+C:\Users\meetm>ollama run mistral "Explain how to lower homocysteine naturally"
+
+C:\Users\meetm>
+
+You have two options:
+
+  Option 1 — Start Claude Code with auto-approve (recommended)                                                                                                                                            
+  Type ! claude --dangerously-skip-permissions in a new terminal. This skips ALL permission prompts for the entire session. Best for trusted local dev work like this.                                    
+  Option 2 — Per-tool "Always allow"
+
+  When a permission prompt appears, select "Yes, don't ask again" (or the equivalent "Always allow" button). Claude Code remembers that tool for the rest of the session.
+
+  Option 3 — Edit settings permanently
+
+  Add to C:\Users\meetm\.claude\settings.json:
+  {
+    "permissions": {
+      "allow": ["Bash", "Edit", "Write", "Read", "Glob", "Grep"]
+    }
+  }
+
+  This auto-approves those tools in every future session.
+
+  ---
+  My recommendation: Use --dangerously-skip-permissions for your morning trading setup sessions. It's a demo account, local code — no risk. Just start the day with:
+
+  claude --dangerously-skip-permissions
+
+  That way I can go through all the analysis → plan → implement → deploy → verify steps in one uninterrupted flow, which is exactly what you need before market open
+  
+  can u pls continue session  ID TRD-20260416  
+  
+  can u update the session content to this : Session ID TRD-20260416  
+  
+  
+  Step 1: Exit this session                                                                                                                                                                                Type /exit in the prompt (or just close this terminal window).
+                                                                                                                                                                                                           Step 2: Open a new terminal and run:
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI
+  claude --dangerously-skip-permissions
+
+  Step 3: Once Claude starts, paste this as your first message:
+  Continue Session ID TRD-20260416. Read memory file at C:\Users\meetm\.claude\projects\C--Users-meetm-OneDrive-Desktop-GCPPythonCode-DhanAPI\memory\session_TRD_20260416.md to get full context of   what's been built. Today is 2026-04-24, system is running. Check status with: python start_trading_system.py status
+
+  That's it. Claude will load the session memory (all 6 phases of work) and pick up exactly where we left off — with full auto-approve on all tool calls.
+
+
+
+  Created startday_05may26.txt — 12-step start-of-day checklist specifically for Tue 2026-05-05 (the audit day). Mirrors the       format of your existing startday_26apr26.txt but is purpose-built for Phase 15 verification:
+                                                                                                                                   - Steps 1-3: env / API keys / DB integrity (with explicit token-expiry warning since old DayStart noted it expires 2026-05-04
+  18:34 IST)
+  - Step 4: visual confirmation Phase 15 fixes are still in code
+  - Steps 5-8: standard v2 startup + warmup
+  - Step 9: mid-session spot check (OptionScalper count > 1000 by noon = dedup broken)
+  - Steps 10-11: EOD + run audit_v2_runtime.py with the four expected outcomes spelled out explicitly
+  - Step 12: pass/fail branches with likely-culprit hints per failed outcome
+
+  Updated session_TRD_20260416.md — verification day moved from May 4 → May 5; checklist file referenced; token-expiry caveat
+  added.
+
+  Want me to also /schedule a one-time agent for Mon 2026-05-04 evening (your travel day) to ping you a reminder about the
+  Tuesday start, or do you have your own reminder system?
+  
+  
+  
+  
+  Validation Path (don't deploy until each step passes)
+
+  1. Unit test the gates individually — synthetic data, confirm each gate fires correctly in isolation
+  2. Backtest on Apr 16–24 option candle data — already in kite_candles.db — measure: signals/day, win rate, avg winner, avg loser, max drawdown
+  3. Decision rule: ship to live only if backtest shows: signals/day 2–10, win rate ≥ 55%, avg winner ≥ 1.8× avg loser
+  4. First-week paper trial: deploy May 6 at 1 lot only, audit daily via audit_v2_runtime.py
+  5. MetaAgent integration: KB will start tagging these trades as strategy=MultiStrikeScalp — let it learn and filter for ~30 trades before relying on it
+
+  Risks I'd flag honestly
+
+  - Signal density on 6 contracts dilutes edge — most multi-indicator confluence strategies look great on paper and underperform live because the 4-gate AND filter
+  is so restrictive that you fire 0–1 times/day, and one bad day kills the week.
+  - Option premium behavior diverges from spot in IV-crush moments — the anti-fakeout filter helps but isn't bulletproof.
+  - Slippage on ATM-1 / ATM+1 — these have wider bid-ask than ATM. The 30-pt target may be eaten by fills.
+  - Candlestick patterns on 1m option premium are noisier than on spot — pattern detection thresholds need empirical tuning, not standard textbook values.
+
+  Sequencing Recommendation
+
+  1. First, finish Phase 15 verification on 2026-05-05. If those fixes don't hold up live, building Phase 16 on top is wasteful.
+  2. Then build Phase 16 over 2026-05-06 to 2026-05-08 (3 trading days).
+  3. Backtest before any live run — the KB you've already seeded is the test bed.
+  4. First live run no earlier than 2026-05-12 (Monday).
+
+  That gives the system one clean week of v2 baseline data first, which is what MetaAgent needs to start filtering effectively.
+
+  ---
+  Want me to:
+  - (a) Save this plan as PHASE16_PLAN.md in the project root so it's referenceable later, or
+  - (b) Add Phase 16 as the next entry in session_TRD_20260416.md memory, or
+  - (c) Both?
+
+  Or hold off and just keep this in conversation until after May 5?
+  
+  
+  Safe to /exit and restart with claude --dangerously-skip-permissions. First message to paste in the new session:
+
+  Continue Session ID TRD-20260416. Read C:\Users\meetm\.claude\projects\C--Users-meetm-OneDrive-Desktop-GCPPythonCode-DhanAPI\memory\session_TRD_20260416.md —
+  start with the RESUME POINT block at the top.
+
+
+
+  What happens on May 5:
+  1. v2 starts → OptionCandleCollector fires on first market cycle
+  2. Every 5 min it saves NIFTY_24XXX_CE_2026-05-XX and ..._PE_... rows
+  3. By end of week (May 9) you'll have 5 days × ~6 contracts × 375 rows ≈ 11k rows
+  4. Run python -m backtest.multi_strike_backtest — it auto-picks the last 14 days

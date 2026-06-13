@@ -1,0 +1,1599 @@
+"""
+order_placer_dhan_sandbox.py
+----------------------------
+Polls the shared signals DB for new trading signals and places
+PAPER TRADES via Dhan Sandbox API.
+
+Flow:
+  1. Wait for new signal in DB (processed=0)
+  2. Resolve Dhan security_id from signal's tradingsymbol via Dhan scrip master
+  3. Place order on Dhan sandbox (simulated — no real money)
+  4. Mark signal processed; store order_id + order_status back in DB
+
+Run alongside telegram_reader_production.py:
+    python order_placer_dhan_sandbox.py
+
+Stop with Ctrl+C.
+"""
+
+import json
+import logging
+import sys
+import time
+import io
+import mysql_sqlite_bridge
+import sqlite3
+import urllib.request
+import http.cookiejar
+from datetime import datetime, date, time as dtime
+from pathlib import Path
+import threading
+
+# ── Windows encoding fix ───────────────────────────────────────────────────────
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# ── Master Hub path ────────────────────────────────────────────────────────────
+master_lib = r"C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\lib"
+if master_lib not in sys.path:
+    sys.path.append(master_lib)
+from master_resource import MasterResource, get_trading_db_path
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log_ts  = datetime.now().strftime('%d%b%Y_%H_%M_%S').upper()
+log_dir = MasterResource.MASTER_ROOT / 'logs'
+log_dir.mkdir(exist_ok=True)
+log_file = str(log_dir / f"order_placer_dhan_sandbox_{log_ts}.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - DHAN_SANDBOX - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+logger = logging.getLogger("DHAN_SANDBOX_PLACER")
+logger.info(f"[LOG] Writing to: {log_file}")
+
+# ── DhanAPI imports ────────────────────────────────────────────────────────────
+import os
+import pandas as pd
+sys.path.insert(0, str(Path(__file__).parent))
+from core.dhan_client import DhanClient
+from core.strike_lookup import StrikeLookup
+from db_utils import get_db_connection, execute_with_retry, fetch_all
+
+try:
+    from lot_cache import get_lot_size as _get_lot_size
+except ImportError:
+    def _get_lot_size(symbol: str, default: int = 1) -> int:
+        return default
+
+# ── Market hours ───────────────────────────────────────────────────────────────
+import pytz
+IST          = pytz.timezone("Asia/Kolkata")
+MARKET_OPEN  = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
+
+POLL_INTERVAL_S = 5   # check DB every 5 seconds
+
+# ── Sandbox Dhan client ────────────────────────────────────────────────────────
+client       = DhanClient(is_sandbox=True)
+strike_lookup = StrikeLookup()
+
+DB_PATH = get_trading_db_path()
+
+# ── Live config paths ──────────────────────────────────────────────────────────
+_LIVE_CFG_PATH  = MasterResource.MASTER_ROOT / "config" / "live_trading_config.json"
+_SL_CFG_PATH    = MasterResource.MASTER_ROOT / "config" / "sl_config.json"
+_DAILY_PNL_PATH = MasterResource.MASTER_ROOT / "data"   / "daily_pnl_state.json"
+_HM_CFG_PATH    = MasterResource.MASTER_ROOT / "config" / "health_monitor_config.json"
+
+# ── Live config (hot-reloaded every 60 s) ─────────────────────────────────────
+_live_cfg: dict        = {}
+_live_cfg_loaded_at: float = 0.0
+_live_cfg_lock         = threading.Lock()
+
+def _get_live_cfg() -> dict:
+    """Return live_trading_config.json, refreshed at most every 60 s."""
+    global _live_cfg, _live_cfg_loaded_at
+    with _live_cfg_lock:
+        if time.time() - _live_cfg_loaded_at > 60:
+            try:
+                with open(_LIVE_CFG_PATH) as f:
+                    _live_cfg = json.load(f)
+                _live_cfg_loaded_at = time.time()
+                logger.debug("[CFG] live_trading_config reloaded")
+            except Exception as e:
+                logger.warning(f"[CFG] Could not load live_trading_config.json: {e}")
+        return _live_cfg
+
+
+_sl_cfg: dict        = {}
+_sl_cfg_loaded_at: float = 0.0
+_sl_cfg_lock         = threading.Lock()
+
+def _get_sl_cfg() -> dict:
+    """Return sl_config.json (entry/SL filters), refreshed at most every 60 s."""
+    global _sl_cfg, _sl_cfg_loaded_at
+    with _sl_cfg_lock:
+        if time.time() - _sl_cfg_loaded_at > 60:
+            try:
+                with open(_SL_CFG_PATH) as f:
+                    _sl_cfg = json.load(f)
+                _sl_cfg_loaded_at = time.time()
+            except Exception as e:
+                logger.warning(f"[CFG] Could not load sl_config.json: {e}")
+        return _sl_cfg
+
+
+# ── Circuit-break Telegram alert ───────────────────────────────────────────────
+
+def _send_circuit_alert(reason: str):
+    """Send Telegram alert via health-monitor bot when a circuit breaker fires."""
+    try:
+        if not _HM_CFG_PATH.exists():
+            return
+        with open(_HM_CFG_PATH) as f:
+            hm_cfg = json.load(f)
+        bot_token = hm_cfg.get("bot_token", "").strip()
+        chat_id   = hm_cfg.get("alert_chat_id", "").strip()
+        if not bot_token or bot_token.startswith("<"):
+            return
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        msg = (f"\U0001f6a8 <b>CIRCUIT BREAKER TRIGGERED</b>\n"
+               f"\U0001f550 {now_str}\n\n"
+               f"❌ {reason}\n\n"
+               f"⛔ No new orders placed today.\n"
+               f"Edit live_trading_config.json to change limits.")
+        data = json.dumps({"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}).encode()
+        req  = urllib.request.Request(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+        logger.warning(f"[CIRCUIT] TG alert sent: {reason}")
+    except Exception as e:
+        logger.warning(f"[CIRCUIT] TG alert failed: {e}")
+
+
+# ── Risk-control checks ────────────────────────────────────────────────────────
+
+def _check_channel_allowed(channel_name: str) -> str | None:
+    """
+    Return skip reason if channel should be blocked, else None.
+
+    channel_filter_mode (live_trading_config.json):
+      'blocklist' (paper default): allow every channel EXCEPT blocked_channels.
+                                   OmniEngine signals (empty channel_name) always pass.
+      'whitelist'  (prod):         allow only channels in channel_whitelist.
+                                   OmniEngine signals always pass regardless.
+    """
+    if not channel_name:
+        return None   # OmniEngine / internal signals — always allow
+
+    cfg      = _get_live_cfg()
+    mode     = cfg.get("channel_filter_mode", "blocklist").lower()
+    blocked  = cfg.get("blocked_channels", [])
+    ch       = channel_name.lower()
+
+    # Blocklist always enforced regardless of mode
+    for blk in blocked:
+        if blk.lower() in ch:
+            return f"CHANNEL_BLOCKED: '{channel_name}'"
+
+    if mode == "whitelist":
+        whitelist = cfg.get("channel_whitelist", [])
+        for wl in whitelist:
+            if wl.lower() in ch or ch in wl.lower():
+                return None
+        return f"CHANNEL_NOT_WHITELISTED: '{channel_name}'"
+
+    return None   # blocklist mode — not blocked, so allow
+
+
+def _count_today_orders() -> int:
+    """Count orders written to the orders table today."""
+    today = date.today().isoformat()
+    try:
+        with get_db_connection(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM orders WHERE date(created_at)=?", (today,))
+            row = cur.fetchone()
+            return row[0] if row else 0
+    except Exception as e:
+        logger.warning(f"[CAP] Could not count today's orders: {e}")
+        return 0
+
+
+def _check_signal_cap() -> str | None:
+    """Return skip reason if daily signal cap is reached, else None."""
+    cfg        = _get_live_cfg()
+    max_sigs   = int(cfg.get("max_signals_per_day", 0))
+    if max_sigs <= 0:
+        return None
+    count = _count_today_orders()
+    if count >= max_sigs:
+        return f"SIGNAL_CAP: {count}/{max_sigs} orders today — daily cap reached"
+    return None
+
+
+def _get_daily_pnl() -> float:
+    """Read today's realized P&L from the shared state file written by SL Monitor."""
+    try:
+        if not _DAILY_PNL_PATH.exists():
+            return 0.0
+        with open(_DAILY_PNL_PATH) as f:
+            state = json.load(f)
+        if state.get("date") != date.today().isoformat():
+            return 0.0   # stale — different day
+        return float(state.get("realized_pnl", 0.0))
+    except Exception as e:
+        logger.debug(f"[PNL] Could not read daily_pnl_state.json: {e}")
+        return 0.0
+
+
+_circuit_broken = False
+
+def _check_loss_circuit() -> str | None:
+    """Return skip reason if daily loss limit is breached, else None."""
+    global _circuit_broken
+    cfg   = _get_live_cfg()
+    limit = float(cfg.get("daily_loss_limit_inr", 0))
+    if limit >= 0:
+        return None   # not configured (limit must be negative to activate)
+    pnl = _get_daily_pnl()
+    if pnl <= limit:
+        reason = f"CIRCUIT_BREAK: daily P&L Rs.{pnl:+.0f} breached limit Rs.{limit:+.0f}"
+        if not _circuit_broken:
+            _circuit_broken = True
+            if _get_live_cfg().get("alert_on_circuit_break", True):
+                _send_circuit_alert(reason)
+        return reason
+    _circuit_broken = False
+    return None
+
+
+def _check_duplicate_signal(parsed: dict) -> str | None:
+    """
+    Skip if we already have an OPEN order for this contract, or placed one
+    within dedup_cooldown_minutes (default 15).
+
+    Matches on (symbol, strike, option_type) — channel-agnostic, so two
+    channels sending the same contract are still deduped.
+    """
+    symbol      = parsed.get('symbol', '').upper()
+    strike      = parsed.get('strike')
+    option_type = (parsed.get('option_type') or '').upper() \
+                      .replace('CALL', 'CE').replace('PUT', 'PE')
+
+    if not symbol or not strike or not option_type:
+        return None  # futures / unresolvable — skip dedup
+
+    cooldown_min = int(_get_live_cfg().get('dedup_cooldown_minutes', 15))
+    pattern      = f'{symbol}%-{int(float(strike))}-{option_type}'
+    today        = date.today().isoformat()
+
+    try:
+        with get_db_connection(DB_PATH) as conn:
+            row = conn.execute("""
+                SELECT order_id, entry_placed_at, status
+                FROM orders
+                WHERE symbol=? AND tradingsymbol LIKE ? AND date(entry_placed_at)=?
+                ORDER BY entry_placed_at DESC LIMIT 1
+            """, (symbol, pattern, today)).fetchone()
+
+        if not row:
+            return None
+
+        order_id, placed_at, status = row[0], row[1], row[2]
+
+        if status == 'OPEN':
+            return (f"DEDUP: {symbol} {int(float(strike))} {option_type} already OPEN "
+                    f"(order={order_id})")
+
+        if placed_at:
+            try:
+                placed_dt = datetime.fromisoformat(placed_at)
+                age_s = (datetime.now() - placed_dt).total_seconds()
+                if age_s < cooldown_min * 60:
+                    return (f"DEDUP: {symbol} {int(float(strike))} {option_type} placed "
+                            f"{int(age_s/60)}min ago — cooldown={cooldown_min}min "
+                            f"(order={order_id})")
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.debug(f"[DEDUP] DB check error: {e}")
+
+    return None
+
+
+def _check_sl_reentry(parsed: dict) -> str | None:
+    """
+    Block re-entry if the same contract hit SL within reentry_cooldown_minutes.
+    Reads sl_exits written by dhan_sl_monitor._write_sl_exit().
+    reentry_cooldown_minutes=0 disables the check.
+    """
+    symbol      = parsed.get('symbol', '').upper()
+    strike      = parsed.get('strike')
+    option_type = (parsed.get('option_type') or '').upper() \
+                      .replace('CALL', 'CE').replace('PUT', 'PE')
+
+    if not symbol or not strike or not option_type:
+        return None
+
+    cooldown_min = int(_get_sl_cfg().get('reentry_cooldown_minutes', 120))
+    if cooldown_min == 0:
+        return None
+
+    pattern = f'{symbol}%-{int(float(strike))}-{option_type}'
+    today   = date.today().isoformat()
+
+    try:
+        rows = fetch_all(
+            DB_PATH,
+            "SELECT created_at FROM sl_exits WHERE tradingsymbol LIKE ? AND exit_date=? ORDER BY created_at DESC LIMIT 1",
+            (pattern, today),
+        )
+        if rows:
+            sl_time_str = rows[0][0]
+            try:
+                sl_time = datetime.fromisoformat(sl_time_str)
+                age_min = (datetime.now() - sl_time).total_seconds() / 60
+                if age_min < cooldown_min:
+                    return (f"SL_REENTRY: {symbol} {int(float(strike))} {option_type} "
+                            f"hit SL {int(age_min)}min ago — cooldown={cooldown_min}min")
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"[SL_REENTRY] DB check error: {e}")
+
+    return None
+
+
+# ── DB helpers ─────────────────────────────────────────────────────────────────
+
+def _ensure_order_columns():
+    """Add order_id / order_status columns to signals table if missing."""
+    with get_db_connection(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(signals)")
+        cols = {row[1] for row in cur.fetchall()}
+        if 'order_id' not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN order_id TEXT")
+            logger.info("[DB] Added order_id column")
+        if 'order_status' not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN order_status TEXT")
+            logger.info("[DB] Added order_status column")
+        conn.commit()
+
+
+def _get_pending_signals():
+    """Return all unprocessed signals ordered by id."""
+    return fetch_all(
+        DB_PATH,
+        "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC"
+    )
+
+
+def _ensure_orders_table():
+    """Create orders table if it doesn't exist, and add any missing columns."""
+    with get_db_connection(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id         TEXT    UNIQUE,
+                symbol           TEXT,
+                action           TEXT,
+                quantity         INTEGER,
+                entry_price      REAL,
+                stop_loss        REAL,
+                status           TEXT    DEFAULT 'OPEN',
+                tradingsymbol    TEXT,
+                security_id      TEXT,
+                exchange_segment TEXT,
+                strategy_name    TEXT,
+                pnl              REAL,
+                created_at       TEXT,
+                updated_at       TEXT
+            )
+        """)
+        conn.commit()
+        # Add optional columns if missing (table may have been created by OmniEngine)
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(orders)")
+        existing = {row[1] for row in cur.fetchall()}
+        for col, typ in [
+            ("target",              "REAL"),
+            ("channel_name",        "TEXT"),
+            ("signal_id",           "INTEGER"),
+            ("entry_placed_at",     "TEXT"),
+            ("actual_entry_price",  "REAL"),
+            ("strategy_params",     "TEXT"),   # JSON: strategy-specific context (e.g. ORB levels)
+            ("btst_flag",             "INTEGER"),
+            ("btst_sell_date",        "TEXT"),
+            ("position_type",         "TEXT"),
+            ("partial_qty_remaining", "INTEGER"),
+        ]:
+            if col not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
+                    logger.info(f"[DB] Added column orders.{col}")
+                except Exception as _col_err:
+                    logger.warning(f"[DB] Could not add column orders.{col}: {_col_err}")
+        conn.commit()
+
+
+def _write_to_orders_table(signal_id: int, parsed: dict, order_id: str,
+                           instrument: dict):
+    """Write the paper trade into orders table so SL monitor picks it up.
+
+    Sets entry_placed_at and actual_entry_price so the SL monitor's
+    'entry_placed_at IS NOT NULL' filter treats this as a real (filled) trade.
+    """
+    now        = datetime.now().isoformat()
+    ep         = parsed.get('entry_price') or parsed.get('cmp') or 0
+    action     = (parsed.get('action', 'BUY') or 'BUY').upper()   # normalise case
+    raw_sl     = parsed.get('stop_loss') or 0
+
+    # For MCX options: ALWAYS zero the signal SL.
+    # TG signals for MCX options routinely supply the underlying futures price
+    # as the SL level (e.g. "BUY NATURALGAS26JUN330CE at 14.20, SL 317")
+    # which is the futures price, not the option SL.  The SL monitor will
+    # compute a proper ATR-based SL once intraday candle data is available.
+    if instrument.get('exchange_segment') == 'MCX-OPT':
+        if raw_sl != 0:
+            logger.warning(
+                "[MCX-OPT SL GUARD] %s: zeroing signal SL=%.2f (likely futures price) — "
+                "SL monitor will recompute from ATR",
+                instrument.get('trading_symbol', '?'), raw_sl,
+            )
+        raw_sl = 0
+
+    # For all other BUY positions: SL must be BELOW entry price.
+    # Case-normalised action comparison (MCX signals sometimes arrive lowercase).
+    elif action == 'BUY' and raw_sl > ep > 0:
+        logger.warning(
+            "[SL SANITY] BUY %s signal SL %.2f > entry %.2f — "
+            "zeroing; SL monitor will compute correct SL below entry",
+            parsed.get('symbol', '?'), raw_sl, ep,
+        )
+        raw_sl = 0
+
+    # Position type: BTST or LONGTERM based on channel
+    channel_name = parsed.get('channel_name', parsed.get('source', ''))
+    is_btst = 1 if 'BTST' in (channel_name or '').upper() else 0
+    # COMMODITY OPTIONS PRIME = long-term positional (6mo-1yr hold, no intraday exit)
+    position_type = ('LONGTERM' if 'COMMODITY OPTIONS PRIME' in (channel_name or '').upper()
+                     else ('BTST' if is_btst else 'INTRADAY'))
+    btst_sell_date = None
+    if is_btst:
+        from datetime import date, timedelta
+        sell_dt = date.today() + timedelta(days=1)
+        # If sell day falls on weekend, bump to Monday
+        while sell_dt.weekday() >= 5:
+            sell_dt += timedelta(days=1)
+        btst_sell_date = sell_dt.isoformat()
+        logger.info(f"[BTST] Order flagged as BTST — sell_date={btst_sell_date}")
+
+    try:
+        with get_db_connection(DB_PATH) as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO orders
+                    (order_id, symbol, action, quantity, entry_price, stop_loss,
+                     target, status, tradingsymbol, security_id, exchange_segment,
+                     strategy_name, created_at, updated_at, channel_name, signal_id,
+                     entry_placed_at, actual_entry_price, btst_flag, btst_sell_date, position_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                order_id,
+                parsed.get('symbol', ''),
+                action,
+                instrument.get('lot_size', 1),
+                ep,
+                raw_sl,
+                parsed.get('target') or 0,
+                instrument.get('trading_symbol', ''),
+                instrument.get('security_id', ''),
+                instrument.get('exchange_segment', ''),
+                f"TG:{parsed.get('source', 'SIGNAL')}",
+                now, now,
+                parsed.get('source', ''),
+                signal_id,
+                now,   # entry_placed_at  — paper fill is immediate
+                ep,    # actual_entry_price — use signal price as fill price
+                is_btst,
+                btst_sell_date,
+                position_type,
+            ))
+            conn.commit()
+        logger.info(f"[DB] Written to orders table: order_id={order_id}")
+    except Exception as e:
+        logger.warning(f"[DB] Could not write to orders table: {e}")
+
+
+def _mark_processed(signal_id: int, order_id: str, order_status: str):
+    execute_with_retry(
+        DB_PATH,
+        "UPDATE signals SET processed=1, order_id=?, order_status=? WHERE id=?",
+        (order_id, order_status, signal_id)
+    )
+
+
+def _mark_failed(signal_id: int, reason: str):
+    execute_with_retry(
+        DB_PATH,
+        "UPDATE signals SET processed=-1, order_status=? WHERE id=?",
+        (f"FAILED: {reason[:200]}", signal_id)
+    )
+
+
+# ── Security ID resolution ─────────────────────────────────────────────────────
+
+_INDEX_SYMBOLS = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'SENSEX', 'MIDCPNIFTY', 'BANKEX'}
+_MCX_SYMBOLS   = {'COPPER','CRUDEOIL','CRUDEOILM','GOLD','GOLDM','SILVER','SILVERM',
+                  'NATURALGAS','NATURALGASM','ZINC','LEAD','NICKEL','ALUMINIUM','COPPERM'}
+
+# MCX display name → Kite instrument name (handles "NATURAL GAS" with space, etc.)
+_MCX_NAME_MAP = {
+    "NATURAL GAS":  "NATURALGAS",
+    "NATURALGAS":   "NATURALGAS",
+    "NATURALGASM":  "NATURALGASM",
+    "CRUDE OIL":    "CRUDEOIL",
+    "CRUDEOIL":     "CRUDEOIL",
+    "CRUDEOILM":    "CRUDEOILM",
+    "GOLD":         "GOLD",
+    "GOLDM":        "GOLDM",
+    "SILVER":       "SILVER",
+    "SILVERM":      "SILVERM",
+    "COPPER":       "COPPER",
+    "COPPERM":      "COPPERM",
+    "ZINC":         "ZINC",
+    "LEAD":         "LEAD",
+    "NICKEL":       "NICKEL",
+    "ALUMINIUM":    "ALUMINIUM",
+}
+
+# Real contract multipliers (premium is quoted per unit; multiply for financial P&L)
+_MCX_LOT_SIZES = {
+    "NATURALGAS":  1250,   # MMBTU per lot
+    "NATURALGASM":  250,   # MMBTU per mini lot
+    "CRUDEOIL":     100,   # barrels per lot
+    "CRUDEOILM":     10,   # barrels per mini lot
+    "GOLD":         100,   # grams per lot
+    "GOLDM":         10,
+    "SILVER":     30000,   # grams per lot (30 kg)
+    "SILVERM":     5000,
+    "COPPER":      2500,   # kg per lot
+    "COPPERM":      250,
+    "ZINC":        5000,
+    "LEAD":        5000,
+    "NICKEL":      1500,
+    "ALUMINIUM":   5000,
+}
+
+# Cached MCX instruments from Kite (refreshed once per session day)
+_mcx_insts_df:   pd.DataFrame | None = None
+_mcx_insts_date: date | None         = None
+
+
+def _get_mcx_instruments() -> pd.DataFrame | None:
+    """Return MCX instruments DataFrame, cached per calendar day."""
+    global _mcx_insts_df, _mcx_insts_date
+    today = date.today()
+    if _mcx_insts_df is not None and _mcx_insts_date == today:
+        return _mcx_insts_df
+    try:
+        from kite_candle_store import get_kite
+        kite = get_kite()
+        if kite is None:
+            return None
+        df = pd.DataFrame(kite.instruments("MCX"))
+        df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
+        _mcx_insts_df   = df
+        _mcx_insts_date = today
+        logger.info(f"[MCX] Loaded {len(df)} MCX instruments from Kite")
+        return df
+    except Exception as e:
+        logger.warning(f"[MCX] Could not load MCX instruments: {e}")
+        return None
+
+
+def _resolve_mcx_kite(parsed: dict) -> dict | None:
+    """
+    Resolve MCX option.
+
+    Resolution order:
+      1. Local valid_instruments.csv  — fast, no API call, works offline
+      2. Dhan scrip master (OPTFUT, segment M) — direct Dhan security_id
+      3. Live Kite API instruments("MCX") — fallback when CSV is stale
+    """
+    symbol_raw  = parsed.get('symbol', '').strip()
+    kite_name   = _MCX_NAME_MAP.get(symbol_raw.upper(), symbol_raw.upper())
+    strike      = parsed.get('strike')
+    option_type = (parsed.get('option_type') or '').upper().replace('CALL', 'CE').replace('PUT', 'PE')
+    expiry_str  = parsed.get('expiry_date')
+
+    if not kite_name or not strike or option_type not in ('CE', 'PE'):
+        logger.warning(f"[MCX] Incomplete signal data: {symbol_raw} {strike} {option_type}")
+        return None
+
+    today      = date.today()
+    lot_size   = _MCX_LOT_SIZES.get(kite_name, 1)
+
+    # ── Path 1: local valid_instruments.csv ──────────────────────────────────
+    kite_df = _get_kite_csv()
+    if kite_df is not None:
+        mask = (
+            (kite_df['symbol']        == kite_name) &
+            (kite_df['option_type']   == option_type) &
+            (kite_df['strike']        == float(strike)) &
+            (kite_df['expiry_date']   >= today) &
+            (kite_df['exchange']      == 'MCX')
+        )
+        cands = kite_df[mask].copy()
+        if not cands.empty:
+            if expiry_str:
+                try:
+                    tgt = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+                    cands['_diff'] = cands['expiry_date'].apply(lambda d: abs((d - tgt).days))
+                    row = cands.loc[cands['_diff'].idxmin()]
+                except Exception:
+                    row = cands.sort_values('expiry_date').iloc[0]
+            else:
+                row = cands.sort_values('expiry_date').iloc[0]
+
+            trading_sym = str(row['tradingsymbol'])
+            # Get Dhan security_id via scrip master reverse-lookup
+            dhan_info = strike_lookup.get_by_trading_symbol(trading_sym)
+            if dhan_info:
+                security_id = dhan_info['security_id']
+                logger.info(f"[MCX][CSV] Resolved: {trading_sym}  Dhan_id={security_id}  lot={lot_size}")
+                return {
+                    'trading_symbol':   trading_sym,
+                    'security_id':      security_id,
+                    'exchange_segment': 'MCX',
+                    'lot_size':         lot_size,
+                }
+            else:
+                # Use Kite tradingsymbol as placeholder — SL monitor resolves via Kite LTP
+                logger.info(f"[MCX][CSV] Resolved via Kite CSV (no Dhan id): {trading_sym}  lot={lot_size}")
+                return {
+                    'trading_symbol':   trading_sym,
+                    'security_id':      f"MCX_{trading_sym.replace('-','_')}",
+                    'exchange_segment': 'MCX',
+                    'lot_size':         lot_size,
+                }
+
+    # ── Path 2: live Kite API (fallback if CSV stale or missing) ─────────────
+    logger.info(f"[MCX] CSV miss for {kite_name} {strike} {option_type} — trying live Kite API")
+    df = _get_mcx_instruments()
+    if df is None:
+        logger.warning(f"[MCX] Live Kite API unavailable for {kite_name} {strike} {option_type}")
+        return None
+
+    mask = (
+        (df['name']            == kite_name) &
+        (df['instrument_type'] == option_type) &
+        (df['strike']          == float(strike)) &
+        (df['expiry']          >= today)
+    )
+    candidates = df[mask].sort_values('expiry').reset_index(drop=True)
+    if candidates.empty:
+        logger.warning(f"[MCX] No instrument found: {kite_name} {strike} {option_type}")
+        return None
+
+    if expiry_str:
+        try:
+            target = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+            candidates = candidates.copy()
+            candidates['_diff'] = candidates['expiry'].apply(lambda d: abs((d - target).days))
+            row = candidates.loc[candidates['_diff'].idxmin()]
+        except Exception:
+            row = candidates.iloc[0]
+    else:
+        row = candidates.iloc[0]
+
+    trading_sym = str(row['tradingsymbol'])
+    token       = int(row['instrument_token'])
+    logger.info(f"[MCX][API] Resolved: {trading_sym}  token={token}  lot={lot_size}")
+    return {
+        'trading_symbol':   trading_sym,
+        'security_id':      str(token),
+        'exchange_segment': 'MCX',
+        'lot_size':         lot_size,
+        'instrument_token': token,
+    }
+
+
+def _fetch_mcx_option_ltp_now(trading_symbol: str, token: int) -> float | None:
+    """
+    Fetch the current intraday LTP for an MCX option from Kite.
+
+    Two-step: try ltp() first (fast); fall back to historical_data latest close
+    if ltp() returns zero or stale (happens when the option hasn't traded yet today).
+    Returns None if Kite is unavailable or no intraday trade has occurred.
+    """
+    try:
+        from kite_candle_store import get_kite
+        kite = get_kite()
+        if kite is None:
+            return None
+
+        # Step 1: ltp() — instant, but may be stale from previous session
+        key  = f"MCX:{trading_symbol}"
+        resp = kite.ltp([key])
+        price = float((resp.get(key) or {}).get("last_price") or 0)
+        if price > 0:
+            # Validate: confirm with historical_data that this matches today's intraday
+            from datetime import date, datetime as _dt
+            today   = date.today().strftime("%Y-%m-%d")
+            candles = kite.historical_data(token, f"{today} 09:00:00",
+                                           _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                           "minute", continuous=False)
+            if candles:
+                intraday_close = float(candles[-1].get("close", 0))
+                # If ltp() and latest intraday close agree within 10%, use intraday close
+                if intraday_close > 0 and abs(price - intraday_close) / intraday_close <= 0.10:
+                    return intraday_close
+                # They diverge — intraday data is ground truth
+                if intraday_close > 0:
+                    logger.info(
+                        "[MCX-LTP] %s ltp()=%.2f vs intraday_close=%.2f (>10%% diff) "
+                        "— using intraday close", trading_symbol, price, intraday_close
+                    )
+                    return intraday_close
+            # No intraday candles at all — option hasn't traded today yet
+            logger.warning(
+                "[MCX-LTP] %s ltp()=%.2f but no intraday candles found "
+                "— option may not have traded today, fill price unreliable",
+                trading_symbol, price,
+            )
+            return None   # refuse to fill at potentially stale price
+
+        # Step 2: ltp() returned zero — try historical_data directly
+        from datetime import date, datetime as _dt
+        today   = date.today().strftime("%Y-%m-%d")
+        candles = kite.historical_data(token, f"{today} 09:00:00",
+                                       _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                       "minute", continuous=False)
+        if candles:
+            return float(candles[-1].get("close", 0)) or None
+        return None
+    except Exception as e:
+        logger.warning("[MCX-LTP] fetch error for %s: %s", trading_symbol, e)
+        return None
+
+
+def _fetch_nse_bse_option_ltp(kite_ts: str, exchange_segment: str) -> float | None:
+    """Fetch current LTP for an NSE/BSE FNO option via Kite.  Returns None if unavailable."""
+    try:
+        from kite_candle_store import get_kite
+        kite = get_kite()
+        if kite is None:
+            return None
+        exch = {"NSE_FNO": "NFO", "BSE_FNO": "BFO"}.get(exchange_segment)
+        if not exch:
+            return None
+        key   = f"{exch}:{kite_ts}"
+        resp  = kite.ltp([key])
+        price = float((resp.get(key) or {}).get("last_price") or 0)
+        return price if price > 0 else None
+    except Exception as exc:
+        logger.debug("[ENTRY-LTP] %s: %s", kite_ts, exc)
+        return None
+
+
+# Change 4/5: OTM filter + late-entry filter
+_NSE_SPOT_MAP = {
+    "NIFTY":     "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+    "FINNIFTY":  "NIFTY FINANCIAL SERVICES",
+}
+# Fallback values — live values read from sl_config.json at runtime via _get_sl_cfg()
+_OTM_FILTER_PCT    = 3.0   # config key: otm_filter_pct
+_LATE_ENTRY_TIME   = dtime(14, 30)  # config key: late_entry_time
+_NEAR_EXPIRY_DAYS  = 2     # config key: near_expiry_days
+
+# Change 7: VWAP + premium-chase + lot-size filters
+_CANDLE_DB           = r'C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\data\kite_candles.db'
+_VWAP_MAX_ABOVE_PCT  = 5.0    # config key: vwap_max_above_pct
+_CHASE_IDX_MAX_PCT   = 30.0   # config key: chase_idx_max_pct
+_CHASE_STK_MAX_PCT   = 60.0   # config key: chase_stk_max_pct
+_MIN_VWAP_CANDLES    = 5      # config key: min_vwap_candles
+_LOT_SIZE_MAX        = 200    # config key: lot_size_max
+
+# Gap-3: Index momentum direction filter
+# Kite instrument tokens for index spot (stored in candles_1min by instrument_token)
+_INDEX_TOKENS = {
+    "NIFTY":      256265,
+    "BANKNIFTY":  260105,
+    "FINNIFTY":   257801,
+    "MIDCPNIFTY": 288009,
+    "SENSEX":     265,
+}
+_MOMENTUM_CANDLES     = 5      # config key: momentum_candles
+_MOMENTUM_MIN_PCT     = 0.10   # config key: momentum_min_pct
+
+_nse_cj = http.cookiejar.CookieJar()
+_nse_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_nse_cj))
+_nse_opener.addheaders = [
+    ('User-Agent', 'Mozilla/5.0'),
+    ('Accept', 'application/json'),
+    ('Referer', 'https://www.nseindia.com'),
+]
+_spot_cache: dict = {}   # {symbol: (price, timestamp)}
+
+
+def _get_nse_spot(symbol: str) -> float | None:
+    """Fetch index spot price from NSE allIndices. Cached for 60s."""
+    now = time.time()
+    cached = _spot_cache.get(symbol)
+    if cached and now - cached[1] < 60:
+        return cached[0]
+    nse_name = _NSE_SPOT_MAP.get(symbol)
+    if not nse_name:
+        return None
+    try:
+        req  = urllib.request.Request("https://www.nseindia.com/api/allIndices",
+                                      headers={'User-Agent': 'Mozilla/5.0',
+                                               'Accept': 'application/json',
+                                               'Referer': 'https://www.nseindia.com'})
+        resp = _nse_opener.open(req, timeout=5)
+        data = json.loads(resp.read())
+        for rec in data.get('data', []):
+            if rec.get('indexSymbol') == nse_name:
+                price = float(rec['last'])
+                _spot_cache[symbol] = (price, now)
+                return price
+    except Exception as e:
+        logger.debug(f"[SPOT] NSE fetch failed for {symbol}: {e}")
+    return None
+
+
+def _get_candle_sym(symbol: str, strike, option_type: str) -> str | None:
+    """Look up the kite candle tradingsymbol matching this option."""
+    try:
+        conn = sqlite3.connect(_CANDLE_DB, timeout=3)
+        cur  = conn.cursor()
+        cur.execute(
+            'SELECT DISTINCT tradingsymbol FROM candles_1min WHERE tradingsymbol LIKE ?',
+            (f'{symbol}_{int(float(strike))}_{option_type}%',)
+        )
+        r = cur.fetchone()
+        conn.close()
+        return r[0] if r else None
+    except Exception:
+        return None
+
+
+def _compute_vwap_and_open(candle_sym: str) -> tuple:
+    """
+    Fetch today's 1-min candles up to now from kite_candles.db.
+    Returns (vwap_or_None, day_open_or_None).
+    VWAP is None if fewer than _MIN_VWAP_CANDLES candles exist.
+    """
+    today  = date.today().isoformat()
+    now_tz = datetime.now(IST).strftime('%Y-%m-%dT%H:%M:%S+05:30')
+    try:
+        conn = sqlite3.connect(_CANDLE_DB, timeout=3)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT open, high, low, close, volume
+            FROM candles_1min
+            WHERE tradingsymbol=? AND date(dt)=? AND dt <= ?
+            ORDER BY dt
+        """, (candle_sym, today, now_tz))
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            return None, None
+
+        day_open = rows[0][0]
+
+        if len(rows) < int(_get_sl_cfg().get("min_vwap_candles", _MIN_VWAP_CANDLES)):
+            return None, day_open   # day_open useful for chase filter even with few candles
+
+        cum_pv = cum_v = 0.0
+        for _, high, low, close, vol in rows:
+            typical = (high + low + close) / 3
+            v = vol or 0
+            cum_pv += typical * v
+            cum_v  += v
+
+        vwap_val = cum_pv / cum_v if cum_v > 0 else None
+        return vwap_val, day_open
+    except Exception as e:
+        logger.debug(f"[VWAP] Candle DB error for {candle_sym}: {e}")
+        return None, None
+
+
+def _get_index_momentum(symbol: str) -> float | None:
+    """
+    Return the percentage move in the underlying index over the last
+    _MOMENTUM_CANDLES one-minute bars (positive = rising, negative = falling).
+    Returns None when candle data is unavailable (no filter applied).
+    """
+    token = _INDEX_TOKENS.get(symbol)
+    if token is None:
+        return None
+    today_str = date.today().isoformat()
+    now_tz    = datetime.now(IST).strftime('%Y-%m-%dT%H:%M:%S+05:30')
+    try:
+        conn = sqlite3.connect(_CANDLE_DB, timeout=3)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT close FROM candles_1min
+            WHERE instrument_token=? AND date(dt)=? AND dt <= ?
+            ORDER BY dt DESC LIMIT ?
+        """, (token, today_str, now_tz, int(_get_sl_cfg().get("momentum_candles", _MOMENTUM_CANDLES))))
+        rows = cur.fetchall()
+        conn.close()
+        if len(rows) < 2:
+            return None
+        newest = rows[0][0]
+        oldest = rows[-1][0]
+        if not oldest or oldest == 0:
+            return None
+        return (newest - oldest) / oldest * 100.0
+    except Exception as e:
+        logger.debug(f"[MOMENTUM] Candle DB error for {symbol} token={token}: {e}")
+        return None
+
+
+def _should_skip_signal(parsed: dict, is_tg: bool = False) -> str | None:
+    """
+    Return a skip reason string if signal should be rejected, else None.
+    Change 4: OTM filter (>3% OTM on near-expiry weekly options)
+    Change 5: No new entries after 14:30 on near-expiry options
+    Change 7: VWAP guard + premium-chase guard
+    Change 8: VWAP threshold 5% (was 10%), extended to all options incl. stocks
+              Lot-size cap: skip if lot_size > 200
+    is_tg=True: VWAP and MOMENTUM filters are skipped — TG advisor signals carry
+                an explicit entry price that already accounts for current market level.
+    """
+    _slcfg          = _get_sl_cfg()
+    near_expiry_days = int(_slcfg.get("near_expiry_days", _NEAR_EXPIRY_DAYS))
+    otm_filter_pct   = float(_slcfg.get("otm_filter_pct", _OTM_FILTER_PCT))
+    vwap_max_pct     = float(_slcfg.get("vwap_max_above_pct", _VWAP_MAX_ABOVE_PCT))
+    chase_idx_pct    = float(_slcfg.get("chase_idx_max_pct", _CHASE_IDX_MAX_PCT))
+    chase_stk_pct    = float(_slcfg.get("chase_stk_max_pct", _CHASE_STK_MAX_PCT))
+    mom_min_pct      = float(_slcfg.get("momentum_min_pct", _MOMENTUM_MIN_PCT))
+    mom_candles      = int(_slcfg.get("momentum_candles", _MOMENTUM_CANDLES))
+
+    symbol      = parsed.get('symbol', '').upper()
+    strike      = parsed.get('strike')
+    option_type = (parsed.get('option_type') or '').upper().replace('CALL', 'CE').replace('PUT', 'PE')
+    expiry_str  = parsed.get('expiry_date', '')
+
+    # ── Changes 4 + 5: OTM + late-entry (near-expiry index options only) ─────
+    if symbol in _INDEX_SYMBOLS and strike and expiry_str:
+        try:
+            expiry         = date.fromisoformat(expiry_str[:10])
+            days_to_expiry = (expiry - date.today()).days
+        except Exception:
+            days_to_expiry = 99
+
+        if days_to_expiry <= near_expiry_days:
+            cfg      = _get_live_cfg()
+            now_time = datetime.now(IST).time()
+
+            # Late-entry filter — read cutoff from config
+            cutoff_str = cfg.get("late_entry_cutoff_time", "14:30")
+            try:
+                ch, cm    = map(int, cutoff_str.split(":"))
+                cutoff_t  = dtime(ch, cm)
+            except Exception:
+                cutoff_t  = _LATE_ENTRY_TIME
+
+            if now_time >= cutoff_t:
+                # Expiry day (0d) — allow if late_entry_expiry_day_enabled, but apply
+                # tighter OTM filter since there is no time-value buffer left
+                if days_to_expiry == 0 and cfg.get("late_entry_expiry_day_enabled", False):
+                    pass   # fall through to OTM check with tighter threshold below
+                else:
+                    return (f"LATE_ENTRY: {symbol} expiry in {days_to_expiry}d, "
+                            f"after {cutoff_str}")
+
+            spot = _get_nse_spot(symbol)
+            if spot and spot > 0:
+                strike_f  = float(strike)
+                otm_pct   = ((strike_f - spot) / spot * 100) if option_type == 'CE' \
+                            else ((spot - strike_f) / spot * 100)
+                # Tighter OTM threshold for expiry-day last-hour entries
+                if days_to_expiry == 0 and now_time >= cutoff_t:
+                    otm_limit = cfg.get("expiry_day_otm_pct", 1.0)
+                else:
+                    otm_limit = otm_filter_pct
+                if otm_pct > otm_limit:
+                    return (f"OTM_FILTER: {symbol} {strike} {option_type} is "
+                            f"{otm_pct:.1f}% OTM (spot={spot:.0f}, limit={otm_limit}%)")
+
+    if not strike or not option_type:
+        return None
+
+    # ── Change 7: VWAP + premium-chase filter (all options) ──────────────────
+    entry_price = parsed.get('entry_price') or parsed.get('cmp')
+    if not entry_price or float(entry_price) <= 0:
+        return None
+
+    candle_sym = _get_candle_sym(symbol, strike, option_type)
+    if not candle_sym:
+        return None   # no candle data → can't filter, let it through
+
+    vwap_val, day_open = _compute_vwap_and_open(candle_sym)
+    entry_f   = float(entry_price)
+    is_index  = symbol in _INDEX_SYMBOLS
+
+    # Change 8A: VWAP guard — ALL options (index + stock); 5% threshold
+    # Skipped for TG signals: advisor's explicit entry price already accounts for level.
+    if not is_tg and vwap_val and vwap_val > 0:
+        above_pct = (entry_f - vwap_val) / vwap_val * 100
+        if above_pct > vwap_max_pct:
+            return (f"VWAP_FILTER: {symbol} entry {entry_f:.1f} is "
+                    f"{above_pct:.1f}% above VWAP {vwap_val:.1f}")
+
+    # Premium-chase guard — all options; skip if entry far above day's open price
+    if day_open and day_open > 0:
+        chase_pct = (entry_f - day_open) / day_open * 100
+        max_chase = chase_idx_pct if is_index else chase_stk_pct
+        if chase_pct > max_chase:
+            return (f"CHASE_FILTER: {symbol} entry {entry_f:.1f} is "
+                    f"{chase_pct:.1f}% above day open {day_open:.1f}")
+
+    # Gap-3: Index momentum direction filter — only for index options
+    # CE needs rising index; PE needs falling index.  Skip contra-trend entries.
+    # Skipped for TG signals: advisors often call reversals at the exact turning point.
+    if not is_tg and is_index and option_type in ('CE', 'PE'):
+        momentum = _get_index_momentum(symbol)
+        if momentum is not None:
+            if option_type == 'CE' and momentum <= -mom_min_pct:
+                return (f"MOMENTUM_FILTER: {symbol} CE but index falling "
+                        f"{momentum:.2f}% over last {mom_candles} bars")
+            if option_type == 'PE' and momentum >= mom_min_pct:
+                return (f"MOMENTUM_FILTER: {symbol} PE but index rising "
+                        f"{momentum:.2f}% over last {mom_candles} bars")
+
+    return None
+
+
+# ── Kite CSV instrument cache ─────────────────────────────────────────────────
+_kite_csv_df:   pd.DataFrame | None = None
+_kite_csv_date: date | None         = None
+
+def _get_kite_csv() -> pd.DataFrame | None:
+    """Load valid_instruments.csv once per day. Returns None if file missing."""
+    global _kite_csv_df, _kite_csv_date
+    today = date.today()
+    if _kite_csv_df is not None and _kite_csv_date == today:
+        return _kite_csv_df
+    try:
+        from master_resource import get_instruments_path
+        path = get_instruments_path()
+        df = pd.read_csv(path, low_memory=False)
+        df['expiry_date'] = pd.to_datetime(df['expiry_date'], errors='coerce').dt.date
+        _kite_csv_df   = df
+        _kite_csv_date = today
+        logger.info(f"[KITE CSV] Loaded {len(df):,} instruments from {path}")
+        return df
+    except Exception as e:
+        logger.warning(f"[KITE CSV] Could not load: {e}")
+        return None
+
+
+def _resolve_via_kite_csv(
+    symbol:      str,
+    strike:      float,
+    option_type: str,          # "CE", "PE", or "FUT"
+    expiry_date: str | None,
+    is_futures:  bool = False,
+) -> dict | None:
+    """
+    Fallback resolver using local Kite valid_instruments.csv.
+
+    - Finds the matching row by symbol + strike + option_type + nearest expiry.
+    - Uses the Dhan scrip master (via get_by_trading_symbol) to resolve the
+      Dhan security_id from the Kite tradingsymbol.
+    - If Dhan doesn't have it either, uses a synthetic security_id (Kite token
+      placeholder) so the paper trade can be stored and the SL monitor can
+      resolve LTP via tradingsymbol.
+    """
+    df = _get_kite_csv()
+    if df is None:
+        return None
+
+    today = date.today()
+    if is_futures:
+        mask = (
+            (df['symbol'] == symbol) &
+            (df['instrument_type'] == 'FUT') &
+            (df['expiry_date'] >= today)
+        )
+    else:
+        opt = option_type.upper()
+        mask = (
+            (df['symbol'] == symbol) &
+            (df['option_type'] == opt) &
+            (df['strike'] == strike) &
+            (df['expiry_date'] >= today)
+        )
+
+    candidates = df[mask].copy()
+    if candidates.empty:
+        return None
+
+    # Prefer closest expiry to requested date
+    if expiry_date:
+        try:
+            target = datetime.strptime(expiry_date[:10], "%Y-%m-%d").date()
+            candidates['_diff'] = candidates['expiry_date'].apply(
+                lambda d: abs((d - target).days) if d else 9999
+            )
+            candidates = candidates.sort_values('_diff')
+        except Exception:
+            candidates = candidates.sort_values('expiry_date')
+    else:
+        candidates = candidates.sort_values('expiry_date')
+
+    # Prefer NFO over BFO for futures (NSE is more liquid)
+    if is_futures and 'NFO' in candidates['exchange'].values:
+        candidates = candidates[candidates['exchange'] == 'NFO']
+
+    row       = candidates.iloc[0]
+    kite_ts   = str(row['tradingsymbol'])
+    lot_size  = int(row.get('lot_size', 1))
+    exch_kite = str(row.get('exchange', 'NFO'))
+    # Kite exchange → Dhan exchange_segment
+    exch_seg  = {'NFO': 'NSE_FNO', 'BFO': 'BSE_FNO', 'MCX': 'MCX'}.get(exch_kite, 'NSE_FNO')
+
+    # Try to get real Dhan security_id via get_by_trading_symbol
+    dhan_info = strike_lookup.get_by_trading_symbol(kite_ts)
+    if dhan_info:
+        security_id = dhan_info['security_id']
+        exch_seg    = dhan_info['exchange_segment']
+        lot_size    = dhan_info.get('lot_size', lot_size)
+    else:
+        # Use a placeholder — SL monitor will resolve via tradingsymbol on next sync
+        security_id = f"KITE_{kite_ts.replace('-','_')}"
+
+    return {
+        'security_id':      security_id,
+        'trading_symbol':   kite_ts,
+        'expiry_date':      str(row['expiry_date']),
+        'strike':           int(strike),
+        'lot_size':         lot_size,
+        'exchange_segment': exch_seg,
+    }
+
+
+def _resolve_security_id(parsed: dict) -> dict | None:
+    """
+    Map signal fields → Dhan security_id + exchange_segment.
+
+    Strategy:
+      1. FUTURES: hardcoded security_id table
+      2. INDEX OPTIONS (NIFTY/BANKNIFTY/SENSEX etc.):
+         a. Exact Dhan-symbol lookup for the given expiry
+         b. If expiry is past or not found → auto-roll to nearest upcoming expiry
+            at the same strike (channels often send stale expiry dates)
+      3. STOCK OPTIONS (OPTSTK):
+         Use StrikeLookup.get_stock_option() which searches OPTSTK rows
+      4. MCX: resolved via Kite instruments list (paper-traded, not on Dhan)
+
+    Returns dict with security_id, exchange_segment, lot_size, trading_symbol
+    or None if unresolvable.
+    """
+    symbol      = parsed.get('symbol', '').upper()
+    strike      = parsed.get('strike')
+    option_type = (parsed.get('option_type') or '').upper().replace('CALL', 'CE').replace('PUT', 'PE')
+    expiry_date = parsed.get('expiry_date')          # "YYYY-MM-DD"
+    instrument_type = parsed.get('instrument_type', 'OPTIONS')
+
+    # MCX commodities — resolve via Kite instruments for paper tracking
+    # Normalise display names ("NATURAL GAS" → "NATURALGAS") before lookup
+    _kite_name = _MCX_NAME_MAP.get(symbol, symbol)
+    if _kite_name in _MCX_SYMBOLS or parsed.get('exchange', '').upper() == 'MCX':
+        logger.info(f"[MCX] Routing {symbol} → Kite MCX resolution")
+        return _resolve_mcx_kite(parsed)
+
+    # ── FUTURES ───────────────────────────────────────────────────────────────
+    if instrument_type == 'FUTURES':
+        # Hardcoded index futures (security_id stable across expiries)
+        INDEX_FUTURES = {
+            "NIFTY":      {"security_id": "13",  "exchange_segment": "NSE_FNO"},
+            "BANKNIFTY":  {"security_id": "25",  "exchange_segment": "NSE_FNO"},
+            "FINNIFTY":   {"security_id": "27",  "exchange_segment": "NSE_FNO"},
+            "SENSEX":     {"security_id": "51",  "exchange_segment": "BSE_FNO"},
+            "MIDCPNIFTY": {"security_id": "26",  "exchange_segment": "NSE_FNO"},
+        }
+        # lot_size from daily parquet (not hardcoded — SEBI revises each series)
+        for _k in INDEX_FUTURES:
+            INDEX_FUTURES[_k]["lot_size"] = _get_lot_size(_k, default=1)
+        if symbol in INDEX_FUTURES:
+            return {**INDEX_FUTURES[symbol], "trading_symbol": f"{symbol} FUT"}
+
+        # Stock futures — look up via Dhan FUTSTK scrip master
+        result = strike_lookup.get_stock_future(symbol, expiry_date)
+        if result:
+            logger.info(f"[RESOLVE] Stock future: {symbol} → {result['trading_symbol']} "
+                        f"security_id={result['security_id']}")
+            return result
+
+        # Kite fallback for stock futures
+        kite_result = _resolve_via_kite_csv(symbol, 0, 'FUT', expiry_date, is_futures=True)
+        if kite_result:
+            return kite_result
+
+        logger.error(f"[RESOLVE] No futures config for {symbol}")
+        return None
+
+    # Options: need strike + option_type
+    if not strike or not option_type:
+        logger.error(f"[RESOLVE] Missing strike or option_type for {symbol}")
+        return None
+
+    # ── STOCK OPTIONS (OPTSTK) ────────────────────────────────────────────────
+    if symbol not in _INDEX_SYMBOLS:
+        # Check expiry validity; use nearest if missing/expired
+        resolved_expiry = expiry_date
+        if expiry_date:
+            try:
+                exp = date.fromisoformat(expiry_date[:10])
+                if exp < date.today():
+                    logger.warning(f"[RESOLVE] {symbol} stock option expiry {expiry_date} is past — "
+                                   f"rolling to nearest upcoming expiry")
+                    resolved_expiry = strike_lookup.get_nearest_stock_expiry(symbol)
+            except Exception:
+                pass
+
+        result = strike_lookup.get_stock_option(
+            symbol=symbol,
+            strike=float(strike),
+            option_type=option_type,
+            expiry_date=resolved_expiry[:10] if resolved_expiry else None,
+        )
+        if result:
+            log_tag = "rolled" if resolved_expiry != expiry_date else "exact"
+            logger.info(f"[RESOLVE][Dhan] Stock option ({log_tag}): "
+                        f"{symbol} {strike} {option_type} expiry={resolved_expiry} "
+                        f"→ security_id={result['security_id']} exch={result['exchange_segment']}")
+            return result
+
+        # ── Kite CSV fallback ────────────────────────────────────────────────────
+        logger.warning(f"[RESOLVE] Dhan OPTSTK miss — trying Kite CSV: "
+                       f"{symbol} {strike} {option_type} expiry={resolved_expiry}")
+        kite_result = _resolve_via_kite_csv(symbol, float(strike), option_type, resolved_expiry)
+        if kite_result:
+            logger.info(f"[RESOLVE][Kite] Stock option: {symbol} {strike} {option_type} "
+                        f"→ security_id={kite_result['security_id']} sym={kite_result['trading_symbol']}")
+            return kite_result
+
+        logger.error(f"[RESOLVE] Could not resolve stock option: {symbol} {strike} {option_type} "
+                     f"expiry={resolved_expiry} — both Dhan and Kite CSV miss")
+        return None
+
+    # ── INDEX OPTIONS (OPTIDX) ────────────────────────────────────────────────
+    # Check if expiry is in the past — if so, roll to nearest upcoming expiry
+    resolved_expiry = expiry_date
+    if expiry_date:
+        try:
+            exp = date.fromisoformat(expiry_date[:10])
+            if exp < date.today():
+                nearest = strike_lookup.get_nearest_expiry(symbol)
+                logger.warning(f"[RESOLVE] {symbol} expiry {expiry_date} is past — "
+                               f"rolling to nearest: {nearest}")
+                resolved_expiry = nearest
+        except Exception:
+            pass
+
+    # Try exact Dhan-symbol lookup: "NIFTY-Apr2026-23000-CE"
+    if resolved_expiry:
+        try:
+            exp_dt    = datetime.strptime(resolved_expiry[:10], "%Y-%m-%d")
+            month_str = exp_dt.strftime("%b%Y")
+            dhan_sym  = f"{symbol}-{month_str}-{int(float(strike))}-{option_type}"
+            result    = strike_lookup.get_by_trading_symbol(dhan_sym)
+            if result:
+                logger.info(f"[RESOLVE] Exact match: {dhan_sym} → security_id={result['security_id']}")
+                return result
+        except Exception as e:
+            logger.debug(f"[RESOLVE] Exact lookup error: {e}")
+
+    # Fallback: ATM lookup at nearest expiry
+    try:
+        result = strike_lookup.get_atm_option(
+            symbol=symbol,
+            spot=float(strike),
+            option_type=option_type,
+            expiry_date=resolved_expiry[:10] if resolved_expiry else None,
+            itm_shift=False,
+        )
+        if result:
+            logger.info(f"[RESOLVE] ATM fallback: {symbol} {strike} {option_type} expiry={resolved_expiry} → "
+                        f"security_id={result['security_id']} sym={result['trading_symbol']}")
+            return result
+    except Exception as e:
+        logger.debug(f"[RESOLVE] ATM lookup error: {e}")
+
+    # Final fallback: the parser-assigned expiry may simply not exist in the scrip
+    # master (e.g. NIFTY assigned Tuesday but NIFTY expires Thursday).  Try the
+    # nearest expiry that actually exists in the downloaded scrip master.
+    try:
+        nearest_expiry = strike_lookup.get_nearest_expiry(symbol)
+        if nearest_expiry and nearest_expiry != (resolved_expiry[:10] if resolved_expiry else None):
+            result = strike_lookup.get_atm_option(
+                symbol=symbol,
+                spot=float(strike),
+                option_type=option_type,
+                expiry_date=nearest_expiry,
+                itm_shift=False,
+            )
+            if result:
+                logger.info(
+                    f"[RESOLVE] Nearest-expiry fallback: {symbol} {strike} {option_type} "
+                    f"parser_expiry={resolved_expiry} → using {nearest_expiry} "
+                    f"security_id={result['security_id']} sym={result['trading_symbol']}"
+                )
+                return result
+    except Exception as e:
+        logger.debug(f"[RESOLVE] Nearest-expiry fallback error: {e}")
+
+    logger.error(f"[RESOLVE] Could not resolve: {symbol} {strike} {option_type} expiry={resolved_expiry}")
+    return None
+
+
+# ── Order placement ────────────────────────────────────────────────────────────
+
+_TICK = 0.05
+
+def _mpp_price(entry: float, side: str) -> float:
+    """Market Price Protection: 0.3% buffer, rounded to ₹0.05 tick."""
+    raw = entry * 1.003 if side == "BUY" else entry * 0.997
+    return round(round(raw / _TICK) * _TICK, 2)
+
+
+def place_dhan_order(parsed: dict, signal_id: int) -> tuple[str | None, str, dict | None]:
+    """
+    Simulate a paper trade locally — no broker API call.
+
+    Generates a local PAPER_<signal_id> order ID and returns immediately.
+    Works for every exchange segment (NSE_FNO, BSE_FNO, MCX, etc.) because
+    no real order is sent anywhere.  LTP for SL monitoring is sourced from
+    Kite (already the primary feed in dhan_sl_monitor.py).
+
+    Returns (order_id, status_message, instrument).
+    """
+    action      = parsed.get('action', 'BUY').upper()
+    entry_price = parsed.get('entry_price') or parsed.get('cmp')
+    stop_loss   = parsed.get('stop_loss')
+    target      = parsed.get('target')
+
+    instrument = _resolve_security_id(parsed)
+    if instrument is None:
+        return None, "Could not resolve security_id", None
+
+    exchange_segment = instrument['exchange_segment']
+    lot_size         = instrument.get('lot_size', 1)
+    trading_symbol   = instrument.get('trading_symbol', '')
+
+    # Channel lot-size override (e.g. COPY MY TRADES = 3 lots per signal)
+    _ch_name = parsed.get('channel_name', parsed.get('source', ''))
+    _lot_overrides = _get_live_cfg().get('channel_lot_override', {})
+    for _ch_key, _lots in _lot_overrides.items():
+        if _ch_key.lower() in (_ch_name or '').lower():
+            lot_size = lot_size * int(_lots)
+            logger.info(f"[LOT OVERRIDE] {_ch_name}: {instrument.get('lot_size',1)} × {_lots} lots = {lot_size}")
+            break
+
+    # ── MCX options: override stale TG signal price with real intraday LTP ──
+    # TG signals for MCX options are often sent hours before market open.
+    # By execution time the actual option premium can differ significantly.
+    if exchange_segment == "MCX-OPT":
+        token = instrument.get("instrument_token")
+        if token and trading_symbol:
+            real_ltp = _fetch_mcx_option_ltp_now(trading_symbol, int(token))
+            if real_ltp and real_ltp > 0:
+                logger.info(
+                    "[MCX-LTP] %s fill price override: signal=%.2f → market=%.2f",
+                    trading_symbol, entry_price or 0, real_ltp,
+                )
+                parsed = dict(parsed)            # don't mutate caller's dict
+                parsed['entry_price'] = real_ltp
+                entry_price = real_ltp
+            else:
+                logger.warning(
+                    "[MCX-LTP] %s: could not fetch real intraday LTP — "
+                    "using stale signal price %.2f (P&L tracking will be unreliable)",
+                    trading_symbol, entry_price or 0,
+                )
+
+    order_id = f"PAPER_{signal_id}"
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"[PAPER] Signal #{signal_id} -> {action} {trading_symbol}")
+    logger.info(f"  Entry={entry_price}  SL={stop_loss}  Target={target}")
+    logger.info(f"  segment={exchange_segment}  qty={lot_size} (1 lot)")
+    logger.info(f"  order_id={order_id}  [LOCAL PAPER — no broker call]")
+    logger.info("=" * 60)
+
+    return order_id, f"PAPER @ {entry_price}", instrument
+
+
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def is_market_hours() -> bool:
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    return MARKET_OPEN <= now.time() <= MARKET_CLOSE
+
+
+def run():
+    logger.info("=" * 60)
+    logger.info("[START] Paper Trade Order Placer (Local Simulation)")
+    logger.info(f"  DB    : {DB_PATH}")
+    logger.info(f"  Mode  : LOCAL PAPER — no broker API, Kite for LTP")
+    logger.info(f"  Poll  : every {POLL_INTERVAL_S}s")
+    logger.info("  Stop  : Ctrl+C")
+    logger.info("=" * 60)
+
+    # Log active risk controls at startup
+    cfg = _get_live_cfg()
+    if cfg:
+        logger.info(f"[RISK] live_trading_config loaded:")
+        logger.info(f"  channel_whitelist    : {cfg.get('channel_whitelist', [])}")
+        logger.info(f"  blocked_channels     : {cfg.get('blocked_channels', [])}")
+        logger.info(f"  max_signals_per_day  : {cfg.get('max_signals_per_day', 'OFF')}")
+        logger.info(f"  daily_loss_limit_inr : {cfg.get('daily_loss_limit_inr', 'OFF')}")
+    else:
+        logger.warning("[RISK] live_trading_config.json not found — risk controls inactive")
+
+    _ensure_order_columns()
+    _ensure_orders_table()
+
+    _hb = 0
+    try:
+        while True:
+            if not is_market_hours():
+                logger.debug("[WAIT] Outside market hours — sleeping 60s")
+                time.sleep(60)
+                continue
+
+            pending = _get_pending_signals()
+            if pending:
+                logger.info(f"[POLL] {len(pending)} pending signal(s) found")
+
+            for row in pending:
+                row = dict(row)   # convert sqlite3.Row → plain dict
+                signal_id = row['id']
+                try:
+                    parsed = json.loads(row['parsed_data'])
+                except Exception:
+                    _mark_failed(signal_id, "Invalid JSON in parsed_data")
+                    continue
+
+                channel = row.get('channel_name') or row.get('channel_id') or '?'
+                symbol  = parsed.get('symbol', '?')
+                strike  = parsed.get('strike', '')
+                opt     = parsed.get('option_type', '')
+                action  = parsed.get('action', 'BUY')
+
+                logger.info(f"[SIGNAL] #{signal_id} | {channel} | "
+                            f"{action} {symbol} {strike} {opt}")
+
+                # ── Risk controls (in priority order) ─────────────────────────
+                ch_skip = _check_channel_allowed(channel)
+                if ch_skip:
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {ch_skip}")
+                    _mark_failed(signal_id, ch_skip)
+                    continue
+
+                cap_skip = _check_signal_cap()
+                if cap_skip:
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {cap_skip}")
+                    _mark_failed(signal_id, cap_skip)
+                    continue
+
+                circuit_skip = _check_loss_circuit()
+                if circuit_skip:
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {circuit_skip}")
+                    _mark_failed(signal_id, circuit_skip)
+                    continue
+
+                dedup_skip = _check_duplicate_signal(parsed)
+                if dedup_skip:
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {dedup_skip}")
+                    _mark_failed(signal_id, dedup_skip)
+                    continue
+
+                sl_reentry_skip = _check_sl_reentry(parsed)
+                if sl_reentry_skip:
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {sl_reentry_skip}")
+                    _mark_failed(signal_id, sl_reentry_skip)
+                    continue
+                # ──────────────────────────────────────────────────────────────
+
+                skip_reason = _should_skip_signal(parsed, is_tg=bool(row.get('channel_id')))
+                if skip_reason:
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {skip_reason}")
+                    _mark_failed(signal_id, skip_reason)
+                    continue
+
+                # Change 8C: lot-size cap — resolve early to check before placing
+                # MCX lot_size = physical contract units (not shares), skip cap for MCX
+                _pre = _resolve_security_id(parsed)
+                _lot_max = int(_get_sl_cfg().get("lot_size_max", _LOT_SIZE_MAX))
+                if (_pre and _pre.get('lot_size', 1) > _lot_max
+                        and _pre.get('exchange_segment') != 'MCX-OPT'):
+                    _ls = _pre['lot_size']
+                    skip_reason = f"LOT_SIZE_FILTER: {symbol} lot_size={_ls} > max {_lot_max}"
+                    logger.warning(f"[SKIP] Signal #{signal_id}: {skip_reason}")
+                    _mark_failed(signal_id, skip_reason)
+                    continue
+
+                # Entry price tolerance — skip if real LTP has drifted too far from
+                # the signal's stated entry (catches stale signals after restart / backlog)
+                _entry_tol = float(_get_sl_cfg().get("entry_price_tolerance_pct", 3.0)) / 100
+                if _entry_tol > 0 and _pre and _pre.get("exchange_segment") not in ("MCX-OPT",):
+                    _entry    = float(parsed.get("entry_price") or 0)
+                    _kite_sym = _pre.get("trading_symbol", "")
+                    _exch_seg = _pre.get("exchange_segment", "")
+                    if _entry > 0 and _kite_sym:
+                        _real_ltp = _fetch_nse_bse_option_ltp(_kite_sym, _exch_seg)
+                        if _real_ltp:
+                            _dev = abs(_real_ltp - _entry) / _entry
+                            if _dev > _entry_tol:
+                                _dir = "UP" if _real_ltp > _entry else "DOWN"
+                                skip_reason = (
+                                    f"ENTRY_STALE: LTP={_real_ltp:.1f} moved "
+                                    f"{_dev*100:.1f}% {_dir} from entry={_entry:.1f} "
+                                    f"(tol={_entry_tol*100:.0f}%)"
+                                )
+                                logger.warning(f"[SKIP] Signal #{signal_id}: {skip_reason}")
+                                _mark_failed(signal_id, skip_reason)
+                                continue
+                        else:
+                            logger.debug("[ENTRY-LTP] No LTP for %s — tolerance check skipped", _kite_sym)
+
+                order_id, status, instrument = place_dhan_order(parsed, signal_id)
+
+                if order_id:
+                    _mark_processed(signal_id, order_id, status)
+                    # Write to orders table → SL monitor will pick it up.
+                    # Use the actual fill price from status ("PAPER @ X.XX") so that
+                    # the LTP-overridden entry price (e.g. real MCX option price) is
+                    # correctly recorded rather than the original stale signal price.
+                    if instrument:
+                        write_parsed = dict(parsed)
+                        if status and status.startswith("PAPER @"):
+                            try:
+                                fill_price = float(status.replace("PAPER @", "").strip())
+                                write_parsed['entry_price'] = fill_price
+                            except (ValueError, AttributeError):
+                                pass
+                        _write_to_orders_table(signal_id, write_parsed, order_id, instrument)
+                    logger.info(f"[DONE] Signal #{signal_id} → order_id={order_id} status={status}")
+                else:
+                    _mark_failed(signal_id, status)
+                    logger.error(f"[FAIL] Signal #{signal_id} → {status}")
+
+                time.sleep(0.5)   # brief pause between orders
+
+            _hb += 1
+            if _hb % 24 == 0:  # every ~2 min
+                logger.info("[HEARTBEAT] Order Placer alive — polling for signals")
+
+            time.sleep(POLL_INTERVAL_S)
+
+    except KeyboardInterrupt:
+        logger.info("\n[STOP] Dhan Sandbox Order Placer stopped by user.")
+
+
+if __name__ == '__main__':
+    run()

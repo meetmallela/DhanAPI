@@ -1,0 +1,199 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║            START-OF-DAY CHECKLIST  —  26 Apr 2026                   ║
+║           DhanOmniEngine v2  (15-thread Agentic + RAG)              ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Run ALL steps in order before market opens (9:15 IST).
+Target: complete by 9:00 IST so warmup candles accumulate from open.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Verify Python Environment
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run:
+    C:\ProgramData\anaconda3\python.exe --version
+    C:\ProgramData\anaconda3\python.exe -c "import dhanhq, chromadb, anthropic, flask; print('All core packages OK')"
+
+Expected: Python 3.x, "All core packages OK"
+Fix if missing: conda install / pip install the failing package
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Verify API Keys
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+a) Claude / Anthropic key (needed for MetaAgent RAG+LLM mode):
+   Check: MasterConfiguration\config\claude_api_key.txt
+   Must start with "sk-ant-api..."
+   If missing or expired: replace with fresh key from console.anthropic.com
+
+b) Dhan API credentials:
+   Check: MasterConfiguration\config\dhan_api_key.txt
+         MasterConfiguration\config\dhan_client_id.txt
+   Sandbox: credentials do not expire, but verify is_sandbox=True in DhanOmniEngine_v2.py
+
+c) Kite / Zerodha token (for historical candle data):
+   Check: MasterConfiguration\config\kite_access_token.txt
+   Kite tokens expire daily at midnight IST — MUST refresh every morning.
+   Refresh command:
+       C:\ProgramData\anaconda3\python.exe refresh_kite_token.py
+   OR open Kite developer console → generate token → paste into kite_access_token.txt
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — Check SQLite DB Integrity
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Run:
+    C:\ProgramData\anaconda3\python.exe -c "
+import sqlite3, pathlib
+db = str(pathlib.Path('MasterConfiguration/data/trading.db'))
+conn = sqlite3.connect(db)
+result = conn.execute('PRAGMA integrity_check').fetchone()
+print('DB integrity:', result[0])
+conn.close()"
+
+Expected: "DB integrity: ok"
+If corrupt: restore from most recent backup in MasterConfiguration\backups\
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — Seed / Update ChromaDB (RAG Knowledge Base)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ChromaDB stores historical trade outcomes. MetaAgent uses it to filter signals.
+Run incremental update (adds only new trades from yesterday):
+
+    C:\ProgramData\anaconda3\python.exe -m rag.trade_embedder --incremental
+
+Expected output:
+    "KnowledgeBase: upserted N documents"
+    "trade_embedder: done — X total documents in collection"
+
+If ChromaDB is empty (first run or wiped), do a full seed instead:
+    C:\ProgramData\anaconda3\python.exe -m rag.trade_embedder
+
+Minimum for RAG to activate: 3+ documents (MIN_HISTORY constant in meta_agent.py)
+MetaAgent runs in PASS-THROUGH mode if KB has fewer than 3 records — that is fine
+for live paper trading, but seeding improves signal quality.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — Start the Trading System
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Option A — Full agentic system (DhanOmniEngine_v2, 15 threads):
+    C:\ProgramData\anaconda3\python.exe DhanOmniEngine_v2.py
+
+Option B — Managed start with auto-restart watchdog:
+    C:\ProgramData\anaconda3\python.exe start_trading_system.py start
+
+    Then in a separate terminal:
+    C:\ProgramData\anaconda3\python.exe start_trading_system.py watchdog
+
+Option C — Legacy single-threaded engine (no MetaAgent):
+    C:\ProgramData\anaconda3\python.exe DhanOmniEngine.py
+
+Recommended for production: Option B (watchdog restarts crashed processes).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — Start the Dashboard
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+In a separate terminal:
+    C:\ProgramData\anaconda3\python.exe dhan_dashboard.py
+
+Open browser: http://127.0.0.1:5050
+→ Go to "Agents" tab to see the 15-thread architecture flow and live stats
+→ Go to "Engines" tab to see process health and candle counts
+→ Go to "⚡ Live" tab to see open positions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — Verify All 15 Agents Are Alive
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+In the engine log (MasterConfiguration\logs\dhan_omni_engine_v2_*.log), confirm:
+
+    [v2] All 15 agents started
+    DataAgent → 11 StrategyWorkers → MetaAgent (RAG) → ExecutionAgent
+    MetaAgent mode: RAG+LLM          ← good (has Claude key)
+                or: PASS-THROUGH     ← OK (no key, all signals forwarded)
+
+Expected startup sequence:
+    [v2] Initialising DhanOmniEngine backend...
+    [v2] Backend ready
+    [v2] KnowledgeBase ready — N trade outcomes
+    [v2] 11 strategy workers created
+    [v2] DataAgent wired: 11 subscriptions
+    [v2] All 15 agents started
+
+If any worker shows [DEAD] in health monitor: check log for errors, restart engine.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — Wait for Candle Warmup (9:15 → 9:45 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Strategies require MIN_CANDLES_1M=30 (1m bars) and MIN_CANDLES_5M=6 (5m bars).
+All workers return NEUTRAL until warmup completes — no trades will fire early.
+
+Watch health monitor log every 60s:
+    [v2] Health | alive=15 dead=0 | signal_q=0 approved_q=0 | MetaAgent: ...
+
+Expect first real signals after ~30 minutes of market data (≈ 09:45 IST).
+ORBVWAPWorker needs 15 min of opening range — fires after 09:30.
+TriplePatternWorker fires after ~14:15 (lookback window).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — Intraday Checks
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Throughout the day, monitor:
+  • Dashboard → Agents tab: agent alive/dead, signal counts per worker
+  • Dashboard → ⚡ Live: open positions, SL stage (INITIAL/BREAKEVEN/TRAILING)
+  • Dashboard → Strategy P&L: per-strategy win rate
+  • Dashboard → Engines: last log line per process
+
+Forced close: ALL positions auto-closed at 15:25 IST by SL monitor (hard cutoff).
+Manual kill: Dashboard → red KILL SWITCH button (cancels all orders, squares off).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 10 — End of Day (After 15:30 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+a) Review MetaAgent session stats in log:
+       MetaAgent session stats: total=N executed=M skipped=K filter_rate=X%
+
+b) Run whatif backtest for today:
+       C:\ProgramData\anaconda3\python.exe -m strategies.whatif_runner
+
+c) Stop engine (Ctrl+C or kill PID):
+       C:\ProgramData\anaconda3\python.exe start_trading_system.py stop
+
+d) Tomorrow's ChromaDB seed will pick up today's completed trades (Step 4).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — Key Files
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Engine entry point       : DhanOmniEngine_v2.py
+Agent definitions        : agents/data_agent.py
+                           agents/strategy_worker.py  (11 workers)
+                           agents/meta_agent.py        (RAG filter)
+                           agents/execution_agent.py
+RAG knowledge base       : rag/knowledge_base.py
+RAG seeder               : rag/trade_embedder.py
+Managed launcher         : start_trading_system.py
+Dashboard                : dhan_dashboard.py → http://127.0.0.1:5050
+Strategy reference       : SYSTEM_REFERENCE.md
+Architecture docs        : RAG_Agentic_trading_bot.md
+Logs                     : MasterConfiguration\logs\
+DB                       : MasterConfiguration\data\trading.db
+ChromaDB                 : rag\chroma_db\
+Config / keys            : MasterConfiguration\config\
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — Thread Architecture (15 threads)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Thread 1   : DataAgent          — sync_data() every 10s, fan-out MarketSnapshots
+Threads 2-12 Strategy Workers:
+  A  EMA_9_21          — EMA 9/21 crossover        (1m, TREND only)
+  B  OptionScalper_EMA44 — EMA 44 scalper          (5m, TREND only)
+  C  Supertrend_MACD   — Supertrend + MACD          (5m, TREND only)
+  D  EMA_VWAP_SR       — EMA + VWAP + S/R breakout  (1m, TREND only)
+  E  ORB_VWAP          — Opening Range Breakout      (1m, ALL regimes)
+  F  TriplePattern      — Triple Bottom/Top           (5m, ALL regimes)
+  G  IndexMomentum     — Velocity / big candle        (1m, TREND only)
+  H  BB_MeanReversion  — Bollinger Band extreme       (5m, RANGING only)
+  I  VWAPReclaim       — VWAP reclaim/rejection/2σ   (1m, ALL regimes)
+  J  CPRBreakout       — CPR prev-day H/L/C           (1m, TREND only)
+  K  PairLeadership    — RELIANCE+HDFC → NIFTY bias   (5m, NIFTY only)
+Thread 13  : MetaAgent          — RAG filter (ChromaDB + Claude Haiku)
+Thread 14  : ExecutionAgent     — engine.execute() → Dhan sandbox orders
+Thread 15  : [main thread]      — health monitor, SIGINT/SIGTERM handler
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

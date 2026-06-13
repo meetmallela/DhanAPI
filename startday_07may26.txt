@@ -1,0 +1,189 @@
+╔══════════════════════════════════════════════════════════════════════╗
+║      START-OF-DAY CHECKLIST  —  07 May 2026 onwards (Normal Day)    ║
+║      DhanOmniEngine v2  (27-thread Agentic + RAG)                   ║
+║      Phase 15 VERIFIED on 2026-05-05                                ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+Target: complete all steps by 09:00 IST so warmup candles accumulate.
+First strategy signals expected after 09:45 IST.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Stop yesterday's processes  (clears PID file)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  cd C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI  
+  C:\ProgramData\anaconda3\python.exe start_trading_system.py stop
+
+  (Safe to run even if nothing is running — it just clears the PID file.)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Refresh Kite token  *** DAILY — expires at midnight ***
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. Open Kite developer console → generate new access token
+  2. Open this file and update the "access_token" field:
+         MasterConfiguration\config\kite_config.json
+
+     Example:
+         {
+           "api_key":      "olcwzq15suerys7u",
+           "api_secret":   "v9uikway7nfce4bq01f5ndwckpab5vm2",
+           "access_token": "PASTE_NEW_TOKEN_HERE",   ← update this line
+           "user_id":      "XRM411",
+           ...
+         }
+
+  3. Verify the token works:
+         C:\ProgramData\anaconda3\python.exe -c "
+import sys; sys.path.insert(0, r'C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\lib')
+from kite_candle_store import get_kite, reset_kite
+reset_kite()
+kite = get_kite()
+print('Kite OK' if kite else 'Kite FAILED — check access_token in kite_config.json')"
+
+  ⚠ If this step is skipped, the engine runs but WhatIf backtest gets
+    bhavcopy estimates instead of real 1-min prices (as happened on May 6).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — Verify Dhan token  (only expires occasionally)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C:\ProgramData\anaconda3\python.exe check_token.py
+
+  Expected: "Token valid"
+  If expired: go to https://developer.dhan.co/home → generate new token
+  → update MasterConfiguration\config\dhan_api_key.txt
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — Run pre-flight checks
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C:\ProgramData\anaconda3\python.exe day_start_checks.py
+
+  Should show OK for: token, scrip master, open orders, strike lookup.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — *** START THE FULL TRADING SYSTEM ***
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Double-click:   start_trading_system.bat start
+       OR run:    C:\ProgramData\anaconda3\python.exe start_trading_system.py start
+
+  This starts ALL 6 processes as silent background processes:
+    ✔ TG Reader         (captures Telegram signals)
+    ✔ Order Placer      (submits orders to Dhan sandbox)
+    ✔ SL Monitor        (trails stop-loss, force-closes at 15:25)
+    ✔ OmniEngine v2     (27-thread strategy engine)   ← THE KEY ONE
+    ✔ Dashboard         (http://127.0.0.1:5050)
+    ✔ EOD WhatIf        (auto-runs at 16:00 IST)
+
+  ⚠ DO NOT start only the dashboard manually — the engine will NOT run.
+  ⚠ If it asks "Start anyway? (y/N)" → type y  (PID file from yesterday)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — Confirm engine started
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C:\ProgramData\anaconda3\python.exe start_trading_system.py status
+
+  Expected: all 6 processes show RUNNING.
+
+  Also confirm engine log exists for today:
+      MasterConfiguration\logs\dhan_omni_engine_v2_DDMMMYYYY_*.log
+
+  Open dashboard: http://127.0.0.1:5050 → Agents tab
+  Expected banner in log:
+      [v2] All 27 agents started
+      [v2] MetaAgent mode: RAG+LLM   (or PASS-THROUGH — OK)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — Wait for warmup  (09:15 → 09:45 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  All workers return NEUTRAL until enough candles accumulate.
+  First real signals expected after 09:45.
+  ORB_VWAP: fires after 09:30. OptionScalper: after ~12:45.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — Mid-session sanity check  (around 10:30 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Check strategy signals are firing:
+
+    C:\ProgramData\anaconda3\python.exe -c "
+import sqlite3; from datetime import date
+c = sqlite3.connect(r'C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\MasterConfiguration\data\trading.db')
+rows = c.execute(\"SELECT strategy, COUNT(*) FROM strategy_signals WHERE DATE(ts)=? AND signal IN ('BULLISH','BEARISH') GROUP BY strategy\", (str(date.today()),)).fetchall()
+print('Strategy signals today:')
+[print(f'  {r[0]}: {r[1]}') for r in rows]
+print('Total:', sum(r[1] for r in rows))
+c.close()"
+
+  If result is 0 signals by 10:30 → engine is not running.
+  Fix: run Step 5 again (after running Step 1 to clear PID file).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 9 — End of Day  (after 15:30 IST)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  a) SL monitor auto-closes all positions at 15:25 IST — nothing to do.
+  b) NightlyLearn auto-fires at 16:00 (KB embed + EOD WhatIf backtest).
+  c) KBAudit auto-fires at 16:30.
+  d) EOD Report auto-fires at 20:00.
+
+  Optional — stop processes early (e.g. if restarting PC):
+      C:\ProgramData\anaconda3\python.exe start_trading_system.py stop
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT HAPPENED ON 06 MAY 2026 (for reference)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ✗ Engine (OmniEngine v2) was NOT started → 0 strategy signals all day
+  ✗ Kite token was NOT refreshed → EOD WhatIf used bhavcopy estimates
+  ✓ Dashboard was started (manually, multiple times)
+  ✓ TG Reader continued from May 5 (captured 30 TG signals)
+  ✓ NightlyLearn / EOD Report / KBAudit ran via Task Scheduler
+
+  Root cause: only the dashboard was started, not the full trading system.
+  The engine generates all strategy signals — without it nothing fires.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — Auto-scheduled tasks (no action needed)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  16:00  DhanNightlyLearn        — KB embed + EOD WhatIf backtest
+  16:30  DhanKBAudit             — knowledge base audit
+  20:00  DhanEODReport           — P&L summary report
+  23:59  Trading_Commodity_EOD   — commodity EOD
+  15:45  Trading_EOD_Master      — EOD master
+
+  ⚠ The ENGINE itself is NOT scheduled — it must be started via Step 5.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK REFERENCE — Key files
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Launcher            : start_trading_system.bat  /  start_trading_system.py
+  Engine              : DhanOmniEngine_v2.py
+  Dashboard           : http://127.0.0.1:5050
+  Logs                : MasterConfiguration\logs\
+  DB                  : MasterConfiguration\data\trading.db
+  Kite token file     : MasterConfiguration\config\kite_config.json  (update "access_token" field daily)
+  Dhan token file     : MasterConfiguration\config\dhan_api_key.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+
+
+  Usage:
+
+  # All data ever
+  python export_signals_and_candles.py
+
+  # Single day
+  python export_signals_and_candles.py --date 2026-05-14
+
+  # Date range
+  python export_signals_and_candles.py --from 2026-05-12 --to 2026-05-14
+
+  # Skip per-signal files (faster)
+  python export_signals_and_candles.py --date 2026-05-14 --no-per-signal
+
+  Each per-signal CSV has a comment header block with the full signal metadata (channel, action, strike, expiry, entry price, SL, target) followed by
+  the option's 1-min OHLCV candles for that day — so you can open any one file and immediately see signal → price action together.
+
+
+
+
+Option B — Leave it manual for now
+  Run it separately: C:\ProgramData\anaconda3\python.exe dhan_tg_trader.py in its own terminal. Safer while the new channels are still being validated.
+  
+  (base) C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI>C:\ProgramData\anaconda3\python.exe start_trading_system.py restart

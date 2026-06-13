@@ -1,0 +1,129 @@
+{
+  "_comment": "SL Monitor Configuration - Customize these settings for your trading style",
+  
+  "default_sl_pct": 5.0,
+  "_default_sl_pct_help": "Default SL percentage for stocks/indices (5% = risking 5% per trade)",
+  
+  "commodity_sl_pct": 4.0,
+  "_commodity_sl_pct_help": "SL percentage for commodities (4% avoids circuit limit issues)",
+  
+  "atr_multiplier": 1.5,
+  "_atr_multiplier_help": "ATR multiplier for volatility-based SL (1.5 = 1.5x ATR). Higher = more room, Lower = tighter stops. Try 1.0-2.5",
+  
+  "atr_period": 14,
+  "_atr_period_help": "Number of periods for ATR calculation (14 is standard)",
+  
+  "atr_candle_interval": "5minute",
+  "_atr_candle_interval_help": "Candle size for ATR: 'minute', '5minute', '15minute'. Smaller = more sensitive, Larger = smoother",
+  
+  "atr_lookback_hours": 2,
+  "_atr_lookback_hours_help": "Hours of historical data to fetch for ATR (2 hours = ~24 5-min candles)",
+  
+  "atr_cache_minutes": 5,
+  "_atr_cache_minutes_help": "Cache ATR value for N minutes (reduces API calls)",
+  
+  "commodities": [
+    "CRUDE",
+    "CRUDEOIL", 
+    "GOLD",
+    "GOLDM",
+    "GOLDPETAL",
+    "SILVER",
+    "SILVERM",
+    "SILVERMIC",
+    "COPPER",
+    "ZINC",
+    "NICKEL",
+    "LEAD",
+    "ALUMINIUM",
+    "NATURALGAS"
+  ],
+  "_commodities_help": "Keywords to identify commodities. Any symbol containing these gets commodity_sl_pct instead of default_sl_pct",
+
+  "reentry_cooldown_minutes": 120,
+
+  "daily_loss_limit": -20000,
+  "_daily_loss_limit_help": "Circuit breaker: if realized PnL falls below this (negative INR), block all new algo entries for the day. Reads daily_pnl_state.json maintained by SL monitor.",
+  "_reentry_cooldown_minutes_help": "Minutes to block re-entry after an SL hit. 0 = block all day (old behaviour). 30 = allow re-entry 30 min after SL hit. Applies per exact strike/symbol.",
+
+  "min_hold_candles": 10,
+  "_min_hold_candles_help": "Minutes after entry during which SL checks are suppressed. Protects against opening IV crush and price discovery noise. Was 3; raised to 10 based on 2026-05-15 analysis.",
+
+  "atr_trail_mult": 2.0,
+  "_atr_trail_mult_help": "Trail SL distance = 1-min ATR × this multiplier, anchored to PEAK (not LTP). 2.0 = 2× ATR from peak.",
+
+  "atr_beven_mult": 0.5,
+  "_atr_beven_mult_help": "Move SL to breakeven when gain ≥ atr_beven_mult × ATR. 0.5 = breakeven after half-ATR gain.",
+
+  "breakeven_trigger_pct": 1.0,
+  "_breakeven_trigger_pct_help": "Pct-fallback breakeven (when no ATR data yet). Was 3%; now 1% to match ATR mode behaviour.",
+
+  "trail_trigger_pct": 2.0,
+  "_trail_trigger_pct_help": "Pct-fallback trail trigger. Was 5%; now 2% to engage trail sooner after breakeven.",
+
+  "trail_pct_am": 3.0,
+  "_trail_pct_am_help": "Trail % from PEAK before 13:00 IST. Was 5% from LTP; now 3% from PEAK.",
+
+  "trail_pct_pm": 2.0,
+  "_trail_pct_pm_help": "Trail % from PEAK 13:00–15:00 IST.",
+
+  "atr_max_pct_options": 8.0,
+  "_atr_max_pct_options_help": "Maximum initial SL width for options (cap ATR-based SL at 8%).",
+
+  "max_entries_per_strategy_per_day": 2,
+  "_max_entries_per_strategy_per_day_help": "Max orders per strategy per day. Prevents over-trading a single strategy on choppy days. Raise to 3-4 on strong trending days if needed.",
+
+  "max_algo_per_symbol": 1,
+  "_max_algo_per_symbol_help": "Max concurrent algo positions open per underlying symbol (across all strategies). Live=1 for capital protection. Paper mode overrides to 100 regardless of this value.",
+
+  "max_orders_per_5min": 4,
+  "_max_orders_per_5min_help": "Burst rate limiter: max algo orders placed across ALL strategies in any 5-minute window.",
+
+  "otm_filter_pct": 3.0,
+  "_otm_filter_pct_help": "Skip if strike is more than this % OTM from spot (near-expiry index options only).",
+
+  "late_entry_time": "14:30",
+  "_late_entry_time_help": "No new entries at or after this time (HH:MM IST) for near-expiry options.",
+
+  "near_expiry_days": 2,
+  "_near_expiry_days_help": "Days-to-expiry threshold below which tighter OTM and late-entry filters apply.",
+
+  "vwap_max_above_pct": 5.0,
+  "_vwap_max_above_pct_help": "Skip if option entry price is more than this % above its VWAP (all options).",
+
+  "chase_idx_max_pct": 30.0,
+  "_chase_idx_max_pct_help": "Index options: skip if entry price is more than this % above the day's open price.",
+
+  "chase_stk_max_pct": 60.0,
+  "_chase_stk_max_pct_help": "Stock options: skip if entry price is more than this % above the day's open price.",
+
+  "min_vwap_candles": 5,
+  "_min_vwap_candles_help": "Minimum 1-min candles needed to compute a reliable VWAP.",
+
+  "lot_size_max": 200,
+  "_lot_size_max_help": "Skip if the resolved lot size exceeds this.",
+
+  "momentum_candles": 5,
+  "_momentum_candles_help": "Number of 1-min bars to look back for index momentum direction filter.",
+
+  "momentum_min_pct": 0.10,
+  "_momentum_min_pct_help": "Block CE if index fell more than this % over momentum_candles bars; block PE if index rose more.",
+
+  "orb_end_time": "12:30",
+  "_orb_end_time_help": "No ORB_VWAP entries after this time (HH:MM IST).",
+
+  "orb_min_clearance_pct": 0.1,
+  "_orb_min_clearance_pct_help": "Price must clear the ORB level by at least this % to avoid micro-breakout entries.",
+
+  "orb_adx_min": 22,
+  "_orb_adx_min_help": "Minimum ADX required for an ORB breakout signal.",
+
+  "orb_range_min_pct": 0.3,
+  "_orb_range_min_pct_help": "ORB range must be at least this % of spot.",
+
+  "orb_range_max_pct": 1.2,
+  "_orb_range_max_pct_help": "ORB range must be at most this % of spot.",
+
+  "orb_body_ratio": 0.40,
+  "_orb_body_ratio_help": "Breakout candle body fraction (0.0–1.0) of total candle range. Rejects doji breakouts."
+}

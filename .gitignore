@@ -1,0 +1,31 @@
+﻿# API Credentials & Secrets
+.env
+*.env
+ - Copy.env
+
+# Config files with secrets
+MasterConfiguration/config/telegram_config.json
+MasterConfiguration/config/claude_api_key.txt
+MasterConfiguration/config/kite_config.json
+
+# Session files
+*.session
+*.session-journal
+dhan_bot_session.session
+trading_bot.session
+
+# Log files
+MasterConfiguration/logs/*.log
+
+# Large databases (checked in separately if needed)
+dhan_dashboard.db
+dhan_dashboard.db-wal
+dhan_dashboard.db-shm
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp files
+_tmp_*.py

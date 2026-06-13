@@ -1,0 +1,15 @@
+{
+  "started": "2026-06-12T09:17:31.127206",
+  "pids": {
+    "TG Reader": 13008,
+    "Order Placer": 10108,
+    "SL Monitor": 15516,
+    "OmniEngine": 10740,
+    "Dashboard": 10584,
+    "EOD WhatIf": 6964,
+    "Health Monitor": 12576,
+    "Swing Agent": 14752,
+    "Watchdog": 5264,
+    "Strangle Bot": 12376
+  }
+}

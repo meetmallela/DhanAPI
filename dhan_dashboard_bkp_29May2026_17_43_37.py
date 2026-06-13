@@ -1,0 +1,2297 @@
+"""
+dhan_dashboard.py
+-----------------
+Local Dhan Account Dashboard
+
+Polls the Dhan API every 10 seconds, stores snapshots in a local SQLite DB,
+and serves a live dashboard at http://127.0.0.1:5050
+
+Run:
+    python dhan_dashboard.py
+
+Then open http://127.0.0.1:5050 in your browser.
+"""
+
+import json
+import sqlite3
+import threading
+import time
+import os
+import concurrent.futures
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template, request
+from core.dhan_client import DhanClient
+from master_resource import MasterResource
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+POLL_INTERVAL = 10          # seconds between Dhan API polls
+DB_PATH       = Path(__file__).parent / "dhan_dashboard.db"
+IS_SANDBOX    = True        # flip to False for live account
+
+app    = Flask(__name__)
+client = DhanClient(is_sandbox=IS_SANDBOX)
+logger = MasterResource.setup_shared_logger("dhan_dashboard")
+
+# Shared state: last successful fetch per endpoint + any API errors
+_last_error: dict[str, str] = {}
+_fetch_ts:   dict[str, str] = {}
+_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+def _conn():
+    c = sqlite3.connect(str(DB_PATH), timeout=10)
+    c.row_factory = sqlite3.Row
+    return c
+
+def _init_db():
+    with _conn() as conn:
+        conn.executescript("""
+            PRAGMA journal_mode=WAL;
+
+            CREATE TABLE IF NOT EXISTS funds (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS positions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS holdings (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS trades (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS forever_orders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                fetched_at TEXT    NOT NULL,
+                data       TEXT    NOT NULL
+            );
+
+        """)
+
+def _save(table: str, data):
+    ts = datetime.now().isoformat(timespec="seconds")
+    with _conn() as conn:
+        conn.execute(
+            f"INSERT INTO {table} (fetched_at, data) VALUES (?, ?)",
+            (ts, json.dumps(data, default=str))
+        )
+        # Keep only the latest 500 rows per table
+        conn.execute(
+            f"DELETE FROM {table} WHERE id NOT IN "
+            f"(SELECT id FROM {table} ORDER BY id DESC LIMIT 500)"
+        )
+    with _lock:
+        _fetch_ts[table] = ts
+
+def _latest(table: str):
+    with _conn() as conn:
+        row = conn.execute(
+            f"SELECT fetched_at, data FROM {table} ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row:
+        return {"fetched_at": row["fetched_at"], "data": json.loads(row["data"])}
+    return {"fetched_at": None, "data": None}
+
+# ---------------------------------------------------------------------------
+# Poller
+# ---------------------------------------------------------------------------
+
+_poll_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="DhanPoll")
+DHAN_CALL_TIMEOUT = 15  # seconds — kill hung Dhan sandbox calls
+
+def _safe_fetch(name: str, fn):
+    """Call fn() with a hard timeout; save result; catch + log errors."""
+    try:
+        fut  = _poll_executor.submit(fn)
+        resp = fut.result(timeout=DHAN_CALL_TIMEOUT)
+        if resp.get("status") == "success":
+            _save(name, resp.get("data") or [])
+            with _lock:
+                _last_error.pop(name, None)
+        else:
+            err = (resp.get("remarks") or {})
+            if isinstance(err, dict):
+                err = err.get("error_message", str(err))
+            with _lock:
+                _last_error[name] = str(err)
+            logger.warning(f"API error [{name}]: {err}")
+    except concurrent.futures.TimeoutError:
+        with _lock:
+            _last_error[name] = f"timeout after {DHAN_CALL_TIMEOUT}s"
+        logger.warning(f"Fetch timeout [{name}] — skipping this cycle")
+    except Exception as e:
+        with _lock:
+            _last_error[name] = str(e)
+        logger.error(f"Fetch exception [{name}]: {e}")
+
+def _init_trading_db():
+    """Ensure any tables this dashboard needs in trading.db exist."""
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS director_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts            TEXT    NOT NULL,
+                trade_date    TEXT    NOT NULL,
+                stage         INTEGER NOT NULL,
+                bias          TEXT,
+                confidence    TEXT,
+                gap_pct       REAL,
+                vix           REAL,
+                trend_5d      TEXT,
+                pre_bias      TEXT,
+                override_type TEXT,
+                reasoning     TEXT,
+                UNIQUE(ts, stage)
+            );
+        """)
+        conn.close()
+    except Exception as e:
+        logger.error(f"_init_trading_db error: {e}")
+
+
+def _scrape_director_log():
+    """
+    Parse today's v2 engine log for DirectorAgent events and persist them.
+
+    Two parsing modes:
+    A) Explicit Stage 1 / Stage 2 log lines — emitted when engine starts at market open.
+    B) Health-line fallback — used when engine restarts mid-day (no Stage 1/2 lines).
+       The first health line becomes a pseudo-Stage-1; bias changes become pseudo-Stage-2.
+    """
+    import glob as _glob, re as _re
+    log_dir   = MasterResource.MASTER_ROOT / "logs"
+    today_tag = datetime.now().strftime("%d%b%Y").upper()
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+
+    import os as _os
+    all_v2 = [f for f in _glob.glob(str(log_dir / f"dhan_omni_engine_v2_{today_tag}*.log"))
+              if _os.path.getsize(f) > 0]
+    if not all_v2:
+        return
+    # Use most-recently-modified non-empty log (not alphabetical — empty crash logs sort last)
+    v2_files = sorted(all_v2, key=lambda f: _os.path.getmtime(f), reverse=True)
+
+    try:
+        with open(v2_files[0], "r", encoding="utf-8", errors="replace") as _f:
+            lines = _f.readlines()
+    except Exception:
+        return
+
+    rows: list[dict] = []
+    has_stage1 = False
+    last_health_bias: str | None = None
+
+    for line in lines:
+        line = line.strip()
+
+        # ── A: Explicit Stage 1 / Stage 2 lines ──────────────────────────────
+        if "DirectorAgent Stage 1:" in line and "generating" not in line:
+            ts_m = _re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if not ts_m:
+                continue
+            ts   = ts_m.group(1)
+            body = line.split("DirectorAgent Stage 1:", 1)[-1].strip()
+            m    = _re.match(
+                r"(\w+)\s+\[(\w+)\](?:\s+\[[^\]]*\])?\s*\|\s*"
+                r"gap=([+-]?[\d.]+)%\s+VIX=([\d.]+|N/A)\s+trend=([^|]+)\|(.*)",
+                body
+            )
+            if m:
+                vix_v = None if m.group(4) == "N/A" else float(m.group(4))
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=1,
+                                 bias=m.group(1), confidence=m.group(2),
+                                 gap_pct=float(m.group(3)), vix=vix_v,
+                                 trend_5d=m.group(5).strip(), pre_bias=None,
+                                 override_type=None, reasoning=m.group(6).strip()))
+                has_stage1 = True
+            else:
+                bc = _re.match(r"(\w+)\s+\[(\w+)\]", body)
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=1,
+                                 bias=bc.group(1) if bc else None,
+                                 confidence=bc.group(2) if bc else None,
+                                 gap_pct=None, vix=None, trend_5d=None,
+                                 pre_bias=None, override_type=None, reasoning=body))
+                has_stage1 = True
+
+        elif ("DirectorAgent Stage 2:" in line
+              and "reading opening" not in line
+              and "candles available" not in line):
+            ts_m = _re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if not ts_m:
+                continue
+            ts   = ts_m.group(1)
+            body = line.split("DirectorAgent Stage 2:", 1)[-1].strip()
+            # Stage 2 uses Unicode → arrow: "OVERRIDE BULLISH→BEARISH: reason"
+            ov_m   = _re.match(r"(OVERRIDE|DOWNGRADE|UPGRADE)\s+(\w+)[→>-]+(\w+):\s*(.*)", body)
+            conf_m = _re.match(r"Stage 2 confirmed (\w+):\s*(.*)", body)
+            if ov_m:
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=2,
+                                 bias=ov_m.group(3), confidence=None,
+                                 gap_pct=None, vix=None, trend_5d=None,
+                                 pre_bias=ov_m.group(2), override_type=ov_m.group(1),
+                                 reasoning=ov_m.group(4)))
+            elif conf_m:
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=2,
+                                 bias=conf_m.group(1), confidence=None,
+                                 gap_pct=None, vix=None, trend_5d=None,
+                                 pre_bias=conf_m.group(1), override_type="CONFIRMED",
+                                 reasoning=conf_m.group(2)))
+            else:
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=2,
+                                 bias=None, confidence=None,
+                                 gap_pct=None, vix=None, trend_5d=None,
+                                 pre_bias=None, override_type=None, reasoning=body))
+
+        # ── B: Health-line fallback (engine started mid-day) ─────────────────
+        elif "[v2] Health |" in line and "Director:" in line:
+            ts_m = _re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if not ts_m:
+                continue
+            ts   = ts_m.group(1)
+            dm   = _re.search(
+                r"Director:\s+(\w+)\s+\[(\w+)\]\s*\|\s*"
+                r"gap=([+-]?[\d.]+)%\s+VIX=([\d.]+|N/A)\s+trend=([^|]+)\|([^|]+)",
+                line
+            )
+            if not dm:
+                continue
+            bias      = dm.group(1)
+            conf      = dm.group(2)
+            gap_pct   = float(dm.group(3))
+            vix_v     = None if dm.group(4) == "N/A" else float(dm.group(4))
+            trend     = dm.group(5).strip()
+            reasoning = dm.group(6).strip()
+
+            if not has_stage1 and last_health_bias is None:
+                # First health line of the day → pseudo Stage 1
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=1,
+                                 bias=bias, confidence=conf,
+                                 gap_pct=gap_pct, vix=vix_v, trend_5d=trend,
+                                 pre_bias=None, override_type=None, reasoning=reasoning))
+                last_health_bias = bias
+            elif not has_stage1 and bias != last_health_bias:
+                # Bias changed since last health line → pseudo Stage 2
+                rows.append(dict(ts=ts, trade_date=today_iso, stage=2,
+                                 bias=bias, confidence=None,
+                                 gap_pct=None, vix=None, trend_5d=None,
+                                 pre_bias=last_health_bias, override_type="UPDATE",
+                                 reasoning=reasoning))
+                last_health_bias = bias
+
+    if not rows:
+        return
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        for r in rows:
+            try:
+                conn.execute("""
+                    INSERT OR IGNORE INTO director_log
+                    (ts, trade_date, stage, bias, confidence, gap_pct, vix,
+                     trend_5d, pre_bias, override_type, reasoning)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, (r["ts"], r["trade_date"], r["stage"], r["bias"], r["confidence"],
+                      r["gap_pct"], r["vix"], r["trend_5d"], r["pre_bias"],
+                      r["override_type"], r["reasoning"]))
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"_scrape_director_log write error: {e}")
+
+
+def _poll_loop():
+    """Background thread: hits all Dhan endpoints every POLL_INTERVAL seconds."""
+    today     = datetime.now().strftime("%Y-%m-%d")
+    week_ago  = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    _scrape_n = 0
+
+    while True:
+        _safe_fetch("funds",         lambda: client.dhan.get_fund_limits())
+        _safe_fetch("positions",     lambda: client.dhan.get_positions())
+        _safe_fetch("holdings",      lambda: client.dhan.get_holdings())
+        _safe_fetch("orders",        lambda: client.dhan.get_order_list())
+        _safe_fetch("trades",        lambda: client.dhan.get_trade_book())
+        _safe_fetch("forever_orders",lambda: client.dhan.get_forever())
+
+        _scrape_n += 1
+        if _scrape_n % 6 == 0:   # every ~60 s
+            try:
+                _scrape_director_log()
+            except Exception as _e:
+                logger.error(f"director scrape error: {_e}")
+
+        time.sleep(POLL_INTERVAL)
+
+# ---------------------------------------------------------------------------
+# Strategy P&L helper — reads from trading.db, not dhan_dashboard.db
+# ---------------------------------------------------------------------------
+
+def _strategy_pnl_today():
+    """
+    Returns a list of per-strategy P&L rows for today's CLOSED orders.
+    [{"strategy": "EMA_9_21", "trades": 3, "wins": 2, "losses": 1,
+      "pnl": 450.0, "win_pct": 66.7, "open": 1}, ...]
+    """
+    try:
+        from master_resource import MasterResource
+        trading_db = MasterResource.get_trading_db_path()
+        conn = sqlite3.connect(trading_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        cur  = conn.cursor()
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # Closed trades today grouped by strategy
+        cur.execute("""
+            SELECT
+                COALESCE(strategy_name, 'Unknown') AS strategy,
+                COUNT(*)                            AS trades,
+                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) AS losses,
+                ROUND(SUM(pnl), 2)                  AS pnl
+            FROM orders
+            WHERE status = 'CLOSED'
+              AND DATE(created_at) = ?
+            GROUP BY strategy_name
+            ORDER BY pnl DESC
+        """, (today,))
+        rows = cur.fetchall()
+
+        # Open trades today per strategy
+        cur.execute("""
+            SELECT COALESCE(strategy_name, 'Unknown') AS strategy, COUNT(*) AS open
+            FROM orders
+            WHERE status = 'OPEN'
+              AND DATE(created_at) = ?
+            GROUP BY strategy_name
+        """, (today,))
+        open_map = {r["strategy"]: r["open"] for r in cur.fetchall()}
+        conn.close()
+
+        result = []
+        for r in rows:
+            strat   = r["strategy"]
+            trades  = r["trades"] or 0
+            wins    = r["wins"]   or 0
+            losses  = r["losses"] or 0
+            pnl     = r["pnl"]    or 0.0
+            win_pct = round(wins / trades * 100, 1) if trades else 0.0
+            result.append({
+                "strategy": strat,
+                "trades":   trades,
+                "wins":     wins,
+                "losses":   losses,
+                "pnl":      pnl,
+                "win_pct":  win_pct,
+                "open":     open_map.get(strat, 0),
+            })
+
+        # Add strategies that have open positions today but no closed trades yet
+        for strat, open_count in open_map.items():
+            if not any(r["strategy"] == strat for r in result):
+                result.append({
+                    "strategy": strat,
+                    "trades": 0, "wins": 0, "losses": 0,
+                    "pnl": 0.0, "win_pct": 0.0, "open": open_count,
+                })
+
+        return result
+    except Exception as e:
+        logger.error(f"strategy_pnl_today error: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Flask API — all data fetched from local DB (never blocks on Dhan)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/snapshot")
+def api_snapshot():
+    funds_row     = _latest("funds")
+    positions_row = _latest("positions")
+    holdings_row  = _latest("holdings")
+    orders_row    = _latest("orders")
+    trades_raw    = _latest("trades")
+    forever_row   = _latest("forever_orders")
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Filter trades to today only — removes stale sandbox demo trades (e.g. 2019 RELIANCE)
+    trades_all   = trades_raw["data"] or []
+    trades_today = [t for t in trades_all
+                    if isinstance(t, dict) and str(t.get("createTime") or "").startswith(today_str)]
+    trades_row   = {"fetched_at": trades_raw["fetched_at"], "data": trades_today}
+
+    # ---- P&L summary from positions ----
+    positions = positions_row["data"] or []
+    total_pnl = realized_pnl = unrealized_pnl = 0.0
+    if isinstance(positions, list):
+        for p in positions:
+            realized_pnl   += float(p.get("realizedProfit",   0) or 0)
+            unrealized_pnl += float(p.get("unrealizedProfit", 0) or 0)
+        total_pnl = realized_pnl + unrealized_pnl
+
+    # ---- Filter orders to today only ----
+    orders_all   = orders_row["data"] or []
+    orders_today = []
+    if isinstance(orders_all, list):
+        for o in orders_all:
+            # Dhan returns createTime as "2026-04-12 09:15:30" or similar
+            ct = str(o.get("createTime") or o.get("orderCreateTime") or "")
+            if ct.startswith(today_str):
+                orders_today.append(o)
+
+    orders_row_today = {"fetched_at": orders_row["fetched_at"], "data": orders_today}
+
+    # ---- Order counts (today only) ----
+    order_counts = {"TRADED": 0, "PENDING": 0, "CANCELLED": 0, "REJECTED": 0, "TRANSIT": 0}
+    for o in orders_today:
+        s = (o.get("orderStatus") or "").upper()
+        order_counts[s] = order_counts.get(s, 0) + 1
+
+    # ---- Strategy P&L from trading.db (today's closed orders) ----
+    strategy_pnl = _strategy_pnl_today()
+
+    with _lock:
+        errors = dict(_last_error)
+
+    return jsonify({
+        "funds":          funds_row,
+        "positions":      positions_row,
+        "holdings":       holdings_row,
+        "orders":         orders_row_today,
+        "trades":         trades_row,
+        "forever_orders": forever_row,
+        "pnl_summary": {
+            "total":       round(total_pnl,       2),
+            "realized":    round(realized_pnl,    2),
+            "unrealized":  round(unrealized_pnl,  2),
+        },
+        "order_counts":   order_counts,
+        "strategy_pnl":   strategy_pnl,
+        "errors":         errors,
+        "poll_interval":  POLL_INTERVAL,
+        "is_sandbox":     IS_SANDBOX,
+        "server_time":    datetime.now().isoformat(timespec="seconds"),
+    })
+
+@app.route("/killswitch", methods=["POST"])
+def killswitch():
+    """Emergency kill switch — cancels all pending orders and squares off all open positions."""
+    logger.warning("KILL SWITCH TRIGGERED")
+    results = {"cancelled_orders": [], "squared_off": [], "db_closed": 0, "errors": []}
+
+    # 1. Cancel all pending / transit orders
+    try:
+        orders_resp = client.dhan.get_order_list()
+        if orders_resp.get("status") == "success":
+            for o in (orders_resp.get("data") or []):
+                if (o.get("orderStatus") or "").upper() in ("PENDING", "TRANSIT"):
+                    oid = o.get("orderId")
+                    try:
+                        client.dhan.cancel_order(oid)
+                        results["cancelled_orders"].append(oid)
+                        logger.warning(f"Kill switch: cancelled order {oid}")
+                    except Exception as e:
+                        results["errors"].append(f"cancel {oid}: {e}")
+    except Exception as e:
+        results["errors"].append(f"get_order_list: {e}")
+
+    # 2. Square off all open positions (place counter-side MARKET orders)
+    try:
+        pos_resp = client.dhan.get_positions()
+        if pos_resp.get("status") == "success":
+            for p in (pos_resp.get("data") or []):
+                net_qty = int(p.get("netQty") or 0)
+                if net_qty == 0:
+                    continue
+                side = "SELL" if net_qty > 0 else "BUY"
+                qty  = abs(net_qty)
+                sym  = p.get("tradingSymbol", p.get("securityId", "?"))
+                try:
+                    client.place_order(
+                        security_id      = p["securityId"],
+                        exchange_segment = p["exchangeSegment"],
+                        transaction_type = side,
+                        quantity         = qty,
+                        order_type       = client.dhan.MARKET,
+                        product_type     = client.dhan.INTRA,
+                        price            = 0,
+                    )
+                    results["squared_off"].append(sym)
+                    logger.warning(f"Kill switch: squared off {sym} ({side} {qty})")
+                except Exception as e:
+                    results["errors"].append(f"squareoff {sym}: {e}")
+    except Exception as e:
+        results["errors"].append(f"get_positions: {e}")
+
+    # 3. Mark all OPEN orders in trading.db as CLOSED (reason = KILLSWITCH)
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        cur = conn.execute(
+            "UPDATE orders SET status='CLOSED', updated_at=? WHERE status='OPEN'",
+            (datetime.now().isoformat(),)
+        )
+        results["db_closed"] = cur.rowcount
+        conn.commit()
+        conn.close()
+        logger.warning(f"Kill switch: marked {results['db_closed']} DB orders CLOSED")
+    except Exception as e:
+        results["errors"].append(f"db_update: {e}")
+
+    logger.warning(f"Kill switch complete: {results}")
+    return jsonify(results)
+
+
+@app.route("/api/engines")
+def api_engines():
+    """Return process health + strategy metadata for the Engines tab."""
+    import glob, os
+    log_dir  = MasterResource.MASTER_ROOT / 'logs'
+    today    = datetime.now().strftime('%d%b%Y').upper()   # e.g. 26MAY2026
+    pid_file = Path(__file__).parent / '.trading_pids.json'
+
+    # Load PID map from the launcher's PID file (primary alive check)
+    _pid_map: dict = {}
+    try:
+        import json as _json
+        _pid_map = _json.loads(pid_file.read_text()).get('pids', {})
+    except Exception:
+        pass
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            import psutil
+            return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        except Exception:
+            pass
+        try:
+            out = __import__('subprocess').check_output(
+                ['tasklist', '/FI', f'PID eq {pid}'], text=True, stderr=__import__('subprocess').DEVNULL)
+            return str(pid) in out
+        except Exception:
+            return False
+
+    def _last_log_line(prefix):
+        """Find today's log for a process and return its last non-empty line."""
+        pattern = str(log_dir / f"{prefix}_{today}*.log")
+        files   = sorted(glob.glob(pattern, recursive=False))
+        if not files:
+            # case-insensitive fallback: mixed-case date (e.g. 26May2026)
+            pattern2 = str(log_dir / f"{prefix}_*2026*.log")
+            candidates = [f for f in sorted(glob.glob(pattern2))
+                          if os.path.basename(f).upper().startswith(prefix.upper() + '_' + today[:2])]
+            files = candidates
+        if not files:
+            return None, None
+        path = files[-1]
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+            last = lines[-1] if lines else ''
+            parts = last.split(' - ', 3)
+            return (parts[-1] if len(parts) >= 2 else last), path
+        except Exception:
+            return None, None
+
+    def _is_alive(name, prefix):
+        # 1. PID file check — authoritative; works even when process is idle/quiet
+        pid = _pid_map.get(name)
+        if pid and _pid_alive(pid):
+            _, path = _last_log_line(prefix)
+            last_line = None
+            if path:
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                        lines = [l.strip() for l in f.readlines() if l.strip()]
+                    raw = lines[-1] if lines else ''
+                    parts = raw.split(' - ', 3)
+                    last_line = parts[-1] if len(parts) >= 2 else raw
+                except Exception:
+                    pass
+            return True, last_line
+        # 2. Log freshness fallback (no PID file or PID not found)
+        line, path = _last_log_line(prefix)
+        if not path:
+            return False, None
+        age = time.time() - os.path.getmtime(path)
+        return age < 1800, line   # 30-min window — covers pre-market silence
+
+    processes = []
+    for name, prefix, desc in [
+        ("TG Reader",          "telegram_reader_production", "Monitors 20 channels, parses signals"),
+        ("Order Placer",       "order_placer_dhan_sandbox",  "Places paper trades on Dhan Sandbox"),
+        ("SL Monitor",         "dhan_sl_monitor",            "Trailing SL + forced exit at 15:25"),
+        ("Dashboard",          "dhan_dashboard",             "This dashboard (Flask server)"),
+        ("OmniEngine",         "dhan_omni_engine",           "6 algo strategies on 4 indices"),
+        ("EOD WhatIf",         "eod_whatif",                 "EOD what-if backtest (runs at 16:00)"),
+        ("Health Monitor",     "health_monitor",             "Deep checks: Kite/Claude/signals"),
+        ("Swing Agent",        "swing_agent",                "Daily EOD scan + paper swing positions"),
+    ]:
+        alive, last = _is_alive(name, prefix)
+        processes.append({"name": name, "alive": alive,
+                          "description": desc, "last_log": last})
+
+    strategies = [
+        {"id": "EMA_9_21",         "name": "EMA 9/21 Crossover",
+         "timeframe": "5m",  "logic": "EMA 9 crosses EMA 21 — momentum entry",
+         "instruments": "NIFTY · BANKNIFTY · FINNIFTY · SENSEX"},
+        {"id": "OptionScalper_EMA44","name": "Option Scalper EMA 44",
+         "timeframe": "5m + 15m MTF", "logic": "Price vs EMA 44 + ATR filter + 15m trend alignment",
+         "instruments": "NIFTY · BANKNIFTY · FINNIFTY · SENSEX"},
+        {"id": "Supertrend_MACD",  "name": "Supertrend + MACD",
+         "timeframe": "15m", "logic": "Supertrend direction confirmed by MACD histogram",
+         "instruments": "NIFTY · BANKNIFTY · FINNIFTY · SENSEX"},
+        {"id": "EMA_VWAP_SR",      "name": "EMA + VWAP + S/R",
+         "timeframe": "5m + 15m S/R", "logic": "EMA 9/21 above VWAP, price clears 15m resistance",
+         "instruments": "NIFTY · BANKNIFTY · FINNIFTY · SENSEX"},
+        {"id": "ORB_VWAP",         "name": "Opening Range Breakout",
+         "timeframe": "5m",  "logic": "First 15-min high/low breakout with VWAP confirmation",
+         "instruments": "NIFTY · BANKNIFTY · FINNIFTY · SENSEX"},
+        {"id": "PairLeadership",   "name": "Pair Leadership",
+         "timeframe": "5m",  "logic": "RELIANCE + HDFC both above VWAP & structure high → NIFTY CE",
+         "instruments": "NIFTY (led by RELIANCE + HDFC)"},
+    ]
+
+    tg_parsers = [
+        {"name": "Claude API Parser",       "channels": "RJ / MCX Premium / VIP / Trader Ayushi + 10 more",
+         "instruments": "OPTIONS + FUTURES (all indices + stocks)"},
+        {"name": "Yaatra Parser",           "channels": "Market Yaatra Official",
+         "instruments": "NIFTY / BANKNIFTY / SENSEX / Stocks"},
+        {"name": "ShortTerm Parser",        "channels": "INDEX OPTIONS PRIME / COPY MY TRADES / STOCK OPTIONS PRIME",
+         "instruments": "Index + Stock OPTIONS"},
+        {"name": "WealthWorld Parser",      "channels": "Wealth World Trading Hub",
+         "instruments": "NIFTY / BANKNIFTY options"},
+        {"name": "Sidharth Parser",         "channels": "SIDHARTH SINGH PREMIUM",
+         "instruments": "NIFTY options (conversational drip)"},
+        {"name": "JP Parser",               "channels": "JP Paper trade",
+         "instruments": "Index OPTIONS"},
+    ]
+
+    # Count today's signals per source
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        today_date = datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(trading_db, timeout=5)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT channel_name, COUNT(*) as cnt FROM signals WHERE DATE(timestamp)=? GROUP BY channel_name",
+            (today_date,)
+        ).fetchall()
+        conn.close()
+        total_tg_signals = sum(r["cnt"] for r in rows)
+        for p in tg_parsers:
+            p["signals_today"] = None   # per-parser count not tracked, show total on Claude parser
+        if tg_parsers:
+            tg_parsers[0]["signals_today"] = total_tg_signals
+    except Exception:
+        total_tg_signals = 0
+
+    # Parse latest candle counts from OmniEngine log — scan last 30 lines
+    candle_counts = {}
+    import re as _re
+    _, omni_path = _last_log_line("dhan_omni_engine")
+    if omni_path:
+        try:
+            with open(omni_path, 'r', encoding='utf-8', errors='replace') as _f:
+                _lines = [l.strip() for l in _f.readlines() if l.strip()]
+            # Find the most recent "Candles:" line
+            for _line in reversed(_lines[-30:]):
+                if "Candles:" in _line:
+                    for m in _re.finditer(r"'(\w+)_1m':\s*(\d+)", _line):
+                        candle_counts[m.group(1)] = int(m.group(2))
+                    break
+        except Exception:
+            pass
+
+    return jsonify({
+        "processes":           processes,
+        "strategies":          strategies,
+        "tg_parsers":          tg_parsers,
+        "tg_channel_count":    20,
+        "strategy_pnl_today":  _strategy_pnl_today(),
+        "candle_counts":       candle_counts,
+        "min_candles":         30,
+    })
+
+
+@app.route("/api/signals")
+def api_signals():
+    """Return today's Telegram signals from trading.db."""
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn  = sqlite3.connect(trading_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, channel_name, raw_text, parsed_data, timestamp,
+                   processed, order_id, order_status
+            FROM   signals
+            WHERE  DATE(timestamp) = ?
+            ORDER  BY id DESC
+            LIMIT  100
+        """, (today,)).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            try:
+                parsed = json.loads(r["parsed_data"] or "{}")
+            except Exception:
+                parsed = {}
+            result.append({
+                "id":           r["id"],
+                "channel_name": r["channel_name"],
+                "timestamp":    r["timestamp"],
+                "processed":    r["processed"],
+                "order_id":     r["order_id"] if "order_id" in r.keys() else None,
+                "order_status": r["order_status"] if "order_status" in r.keys() else None,
+                "parsed":       parsed,
+            })
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"api_signals error: {e}")
+        return jsonify([])
+
+
+@app.route("/api/live_trades")
+def api_live_trades():
+    """Return all OPEN paper trades with live LTP, current SL, stage, peak. Polled every 30s."""
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        conn = sqlite3.connect(trading_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT order_id, symbol, tradingsymbol, action, quantity,
+                   entry_price,
+                   COALESCE(ltp,         entry_price) AS ltp,
+                   COALESCE(stop_loss,   0)           AS stop_loss,
+                   COALESCE(sl_stage,    'INITIAL')   AS sl_stage,
+                   COALESCE(peak_price,  entry_price) AS peak_price,
+                   COALESCE(target, 0)                AS target,
+                   COALESCE(price_signal, '{}')       AS price_signal,
+                   status, created_at, updated_at,
+                   COALESCE(channel_name, strategy_name) AS channel_name
+            FROM   orders
+            WHERE  status = 'OPEN'
+            ORDER  BY created_at DESC
+        """).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            entry = d["entry_price"] or 0
+            ltp   = d["ltp"] or entry
+            qty   = d["quantity"] or 1
+            sl    = d["stop_loss"] or 0
+            if entry > 0 and ltp > 0:
+                d["unreal_pnl"] = round((ltp - entry) * qty if d["action"] == "BUY"
+                                        else (entry - ltp) * qty, 2)
+                d["sl_dist_pct"] = round((ltp - sl) / ltp * 100, 1) if sl > 0 and ltp > 0 else None
+                d["gain_pct"]    = round((ltp - entry) / entry * 100, 1)
+            else:
+                d["unreal_pnl"] = 0
+                d["sl_dist_pct"] = None
+                d["gain_pct"] = 0
+            result.append(d)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"api_live_trades error: {e}")
+        return jsonify([])
+
+
+@app.route("/api/paper_trades")
+def api_paper_trades():
+    """Return paper trades for a given date. Optional ?date=YYYY-MM-DD (default: today)."""
+    from flask import request as _req
+    dl_date = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        conn  = sqlite3.connect(trading_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT order_id, symbol, action, quantity, entry_price,
+                   stop_loss, COALESCE(target, 0) as target, status, tradingsymbol,
+                   security_id, exchange_segment, strategy_name,
+                   COALESCE(pnl, 0) as pnl, created_at, updated_at, exit_price,
+                   COALESCE(channel_name, strategy_name) as channel_name,
+                   COALESCE(ltp, entry_price) as ltp
+            FROM   orders
+            WHERE  DATE(created_at) = ?
+            ORDER  BY id DESC
+            LIMIT  200
+        """, (dl_date,)).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d["status"] == "OPEN":
+                entry = d["entry_price"] or 0
+                ltp   = d["ltp"] or entry
+                qty   = d["quantity"] or 1
+                if entry > 0 and ltp != entry:
+                    d["unreal_pnl"] = round(
+                        (ltp - entry) * qty if d["action"] == "BUY"
+                        else (entry - ltp) * qty, 2
+                    )
+                else:
+                    d["unreal_pnl"] = None
+            else:
+                d["unreal_pnl"] = None
+            result.append(d)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"api_paper_trades error: {e}")
+        return jsonify([])
+
+
+@app.route("/download/paper_trades")
+def download_paper_trades():
+    """Download paper trades as CSV. Optional ?date=YYYY-MM-DD (default: today)."""
+    import csv, io as _io
+    from flask import Response, request as _req
+    dl_date = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        conn = sqlite3.connect(trading_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT order_id, symbol, tradingsymbol, action, quantity, entry_price,
+                   stop_loss, target, status, strategy_name, channel_name, pnl, created_at, updated_at
+            FROM   orders
+            WHERE  DATE(created_at) = ?
+            ORDER  BY id
+        """, (dl_date,)).fetchall()
+        conn.close()
+        if not rows:
+            return f"No paper trades for {dl_date}", 404
+        out = _io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(rows[0].keys())
+        for r in rows:
+            writer.writerow(list(r))
+        csv_bytes = out.getvalue().encode("utf-8")
+        return Response(
+            csv_bytes,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=paper_trades_{dl_date}.csv"},
+        )
+    except Exception as e:
+        logger.error(f"download_paper_trades error: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/api/whatif")
+def api_whatif():
+    """Return what-if backtest rows. Optional ?date=YYYY-MM-DD (default: today)."""
+    from flask import request as _req
+    dl_date = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT run_date, signal_id, symbol, tradingsymbol, channel_name, action,
+                   entry_time, entry_price, sl_initial, exit_time, exit_price,
+                   exit_reason, pnl_per_unit, pnl_pct, max_price, min_price,
+                   lot_size, pnl_total, result, data_quality, expiry_date
+            FROM   whatif_trades
+            WHERE  run_date = ?
+            ORDER  BY signal_id
+        """, (dl_date,)).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        logger.error(f"api_whatif error: {e}")
+        return jsonify([])
+
+
+@app.route("/download/signals")
+def download_signals():
+    """Download signals as CSV. Optional ?date=YYYY-MM-DD (default: today)."""
+    import csv, io as _io
+    from flask import Response, request as _req
+    dl_date = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        conn = sqlite3.connect(trading_db, timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, channel_name, timestamp, processed, order_id, order_status,
+                   parsed_data
+            FROM   signals
+            WHERE  DATE(timestamp) = ?
+            ORDER  BY id
+        """, (dl_date,)).fetchall()
+        conn.close()
+        out = _io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["id","channel_name","timestamp","processed","order_id",
+                         "order_status","symbol","strike","option_type","action",
+                         "entry_price","expiry_date","instrument_type","exchange"])
+        for r in rows:
+            try:
+                p = json.loads(r["parsed_data"] or "{}")
+            except Exception:
+                p = {}
+            writer.writerow([
+                r["id"], r["channel_name"], r["timestamp"], r["processed"],
+                r["order_id"] if "order_id" in r.keys() else "",
+                r["order_status"] if "order_status" in r.keys() else "",
+                p.get("symbol",""), p.get("strike",""), p.get("option_type",""),
+                p.get("action",""), p.get("entry_price",""), p.get("expiry_date",""),
+                p.get("instrument_type",""), p.get("exchange",""),
+            ])
+        csv_bytes = out.getvalue().encode("utf-8")
+        return Response(
+            csv_bytes,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=signals_{dl_date}.csv"},
+        )
+    except Exception as e:
+        logger.error(f"download_signals error: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/download/whatif")
+def download_whatif():
+    """Download what-if backtest results as CSV. Optional ?date=YYYY-MM-DD."""
+    from flask import Response, request as _req, send_file
+    dl_date = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    report_path = Path(MasterResource.MASTER_ROOT) / "reports" / f"whatif_{dl_date}.csv"
+    if report_path.exists():
+        return send_file(str(report_path), mimetype="text/csv", as_attachment=True,
+                         download_name=f"whatif_{dl_date}.csv")
+    # Fallback: query DB directly
+    import csv, io as _io
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT * FROM whatif_trades WHERE run_date = ? ORDER BY signal_id
+        """, (dl_date,)).fetchall()
+        conn.close()
+        if not rows:
+            return f"No what-if data for {dl_date}", 404
+        out = _io.StringIO()
+        writer = csv.writer(out)
+        writer.writerow(rows[0].keys())
+        for r in rows:
+            writer.writerow(list(r))
+        csv_bytes = out.getvalue().encode("utf-8")
+        return Response(
+            csv_bytes,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=whatif_{dl_date}.csv"},
+        )
+    except Exception as e:
+        logger.error(f"download_whatif error: {e}")
+        return f"Error: {e}", 500
+
+
+@app.route("/api/history")
+def api_history():
+    """Per-day WhatIf P&L split into TG Channels vs Algo Strategies.
+
+    orders.pnl is excluded — it contains corrupted values (entry_price=0 bug
+    creating phantom million-rupee gains/losses).  All P&L figures come from
+    whatif_trades which is simulated from Kite 1-min candles.
+    """
+    _ALGO_STRATS = {
+        # A–K
+        "EMA_9_21","OptionScalper_EMA44","Supertrend_MACD","EMA_VWAP_SR",
+        "ORB_VWAP","TriplePattern","IndexMomentum","BB_MeanReversion",
+        "VWAPReclaim","CPRBreakout","PairLeadership",
+        # L–V (Phase 16–19)
+        "MultiStrikeScalp","Ichimoku","SMC_FVG_BOS","FibRetracement",
+        "StochRSI_Div","MACD_Hist_Div","ElliotWave","Harmonic_Pattern",
+        "Candle_Reversal","Donchian_Breakout","MultiTF_EMA",
+        # Y + daemons (Phase 22–23)
+        "VWAP_Slope","GammaBlast",
+        "VIXStraddle_CE","VIXStraddle_PE",
+        "IronCondor_ShortC","IronCondor_ShortP",
+        "WklyStrangle_ShortC","WklyStrangle_ShortP",
+        "RedDaySeller_CE",
+    }
+    _ph = ",".join("?" * len(_ALGO_STRATS))
+    _al = list(_ALGO_STRATS)
+
+    _wi_q = """
+        SELECT run_date,
+               COUNT(*) as signals,
+               SUM(CASE WHEN result='PROFIT' THEN 1 ELSE 0 END) as wins,
+               SUM(CASE WHEN result='LOSS'   THEN 1 ELSE 0 END) as losses,
+               ROUND(SUM(COALESCE(pnl_total,0)), 2) as total_pnl,
+               ROUND(MAX(pnl_total), 2) as best_trade,
+               ROUND(MIN(pnl_total), 2) as worst_trade
+        FROM whatif_trades WHERE data_available=1 {filt}
+        GROUP BY run_date ORDER BY run_date
+    """
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+
+        tg_rows   = conn.execute(_wi_q.format(filt=f"AND channel_name NOT IN ({_ph})"), _al).fetchall()
+        algo_rows = conn.execute(_wi_q.format(filt=f"AND channel_name IN ({_ph})"),     _al).fetchall()
+        all_rows  = conn.execute(_wi_q.format(filt=""),                                 []).fetchall()
+        conn.close()
+
+        tg_map   = {r['run_date']: dict(r) for r in tg_rows}
+        algo_map = {r['run_date']: dict(r) for r in algo_rows}
+        all_map  = {r['run_date']: dict(r) for r in all_rows}
+        all_dates = sorted(all_map.keys())
+
+        result = []
+        for dt in all_dates:
+            result.append({
+                "date":     dt,
+                "tg":       tg_map.get(dt),
+                "algo":     algo_map.get(dt),
+                "combined": all_map.get(dt),
+            })
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"api_history error: {e}")
+        return jsonify([])
+
+
+@app.route("/api/history/day")
+def api_history_day():
+    """Detail: actual orders + whatif rows for a single date."""
+    from flask import request as _req
+    dt = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+
+        orders = conn.execute("""
+            SELECT signal_id, order_id, symbol, tradingsymbol, action, quantity,
+                   entry_price, exit_price, COALESCE(pnl, 0) as pnl,
+                   sl_stage, created_at, updated_at,
+                   COALESCE(channel_name, strategy_name) as source
+            FROM orders
+            WHERE status = 'CLOSED' AND date(created_at) = ?
+            ORDER BY updated_at
+        """, (dt,)).fetchall()
+
+        whatif = conn.execute("""
+            SELECT signal_id, symbol, tradingsymbol, channel_name, action,
+                   entry_time, entry_price, sl_initial, exit_price, exit_time,
+                   exit_reason, pnl_per_unit, pnl_pct, pnl_total, result,
+                   lot_size, data_quality, expiry_date
+            FROM whatif_trades
+            WHERE run_date = ?
+            ORDER BY signal_id
+        """, (dt,)).fetchall()
+        conn.close()
+
+        return jsonify({
+            "date":   dt,
+            "orders": [dict(r) for r in orders],
+            "whatif": [dict(r) for r in whatif],
+        })
+    except Exception as e:
+        logger.error(f"api_history_day error: {e}")
+        return jsonify({"date": dt, "orders": [], "whatif": []})
+
+
+@app.route("/api/strategy-signals")
+def api_strategy_signals():
+    """Return strategy evaluation log for today (or ?date=YYYY-MM-DD).
+    Also returns per-strategy WhatIf P&L summary for the same date.
+    """
+    from flask import request as _req
+    query_date = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute("""
+            SELECT id, ts, index_name, strategy, signal, spot,
+                   candles_1m, candles_5m, indicators
+            FROM   strategy_signals
+            WHERE  DATE(ts) = ?
+            ORDER  BY id DESC
+            LIMIT  500
+        """, (query_date,)).fetchall()
+
+        # Per-strategy WhatIf P&L for the same date
+        wi_rows = conn.execute("""
+            SELECT channel_name,
+                   COUNT(*) as signals,
+                   SUM(CASE WHEN result='PROFIT' THEN 1 ELSE 0 END) as wins,
+                   SUM(CASE WHEN result='LOSS'   THEN 1 ELSE 0 END) as losses,
+                   ROUND(SUM(COALESCE(pnl_total,0)), 0) as total_pnl,
+                   ROUND(AVG(pnl_pct), 1) as avg_pnl_pct
+            FROM   whatif_trades
+            WHERE  run_date = ? AND data_available = 1
+            GROUP  BY channel_name
+        """, (query_date,)).fetchall()
+
+        conn.close()
+
+        signals = []
+        for r in rows:
+            try:
+                ind = json.loads(r["indicators"] or "{}")
+            except Exception:
+                ind = {}
+            signals.append({
+                "id":         r["id"],
+                "ts":         r["ts"],
+                "index":      r["index_name"],
+                "strategy":   r["strategy"],
+                "signal":     r["signal"],
+                "spot":       r["spot"],
+                "candles_1m": r["candles_1m"],
+                "candles_5m": r["candles_5m"],
+                "indicators": ind,
+            })
+
+        whatif_summary = {r["channel_name"]: dict(r) for r in wi_rows}
+
+        return jsonify({"signals": signals, "whatif_summary": whatif_summary})
+    except Exception as e:
+        logger.error(f"api_strategy_signals error: {e}")
+        return jsonify({"signals": [], "whatif_summary": {}})
+
+
+@app.route("/api/agent_status")
+def api_agent_status():
+    """
+    Return live status for all 15 DhanOmniEngine_v2 agents.
+    Derives alive/dead from log-file age; signal counts from strategy_signals table;
+    MetaAgent stats from recent log lines.
+    """
+    import glob as _glob, re as _re, os as _os
+
+    log_dir = MasterResource.MASTER_ROOT / "logs"
+    today   = datetime.now().strftime("%d%b%Y").upper()
+
+    # ── find today's v2 log ──────────────────────────────────────────
+    v2_log_path = None
+    v2_pattern  = str(log_dir / f"dhan_omni_engine_v2_{today}*.log")
+    v2_files    = sorted(_glob.glob(v2_pattern))
+    if v2_files:
+        v2_log_path = v2_files[-1]
+
+    engine_alive    = False
+    engine_last     = None
+    meta_stats      = {"total": 0, "executed": 0, "skipped": 0, "filter_rate": 0, "mode": "UNKNOWN"}
+    director_thesis = {"bias": "NEUTRAL", "confidence": "LOW", "gap_pct": 0.0,
+                       "vix": 0.0, "trend_5d": "—", "reasoning": "pending",
+                       "open_confirmed": False, "pre_bias": ""}
+
+    if v2_log_path:
+        age = time.time() - _os.path.getmtime(v2_log_path)
+        engine_alive = age < 120   # alive if written to in last 2 min
+        try:
+            with open(v2_log_path, "r", encoding="utf-8", errors="replace") as _f:
+                lines = [l.strip() for l in _f.readlines() if l.strip()]
+            if lines:
+                engine_last = lines[-1].split(" - ", 3)[-1]
+
+            # Parse MetaAgent stats from last Health line
+            for line in reversed(lines[-100:]):
+                if "MetaAgent:" in line and "total=" in line:
+                    m = _re.search(r"total=(\d+)\s+executed=(\d+)\s+skipped=(\d+)\s+\(([0-9.]+)%", line)
+                    if m:
+                        meta_stats["total"]       = int(m.group(1))
+                        meta_stats["executed"]    = int(m.group(2))
+                        meta_stats["skipped"]     = int(m.group(3))
+                        meta_stats["filter_rate"] = float(m.group(4))
+                    break
+
+            # MetaAgent mode: RAG+LLM or PASS-THROUGH
+            for line in reversed(lines[-200:]):
+                if "MetaAgent mode:" in line:
+                    meta_stats["mode"] = "RAG+LLM" if "RAG+LLM" in line else "PASS-THROUGH"
+                    break
+                if "mode=RAG+LLM" in line:
+                    meta_stats["mode"] = "RAG+LLM"
+                    break
+                if "mode=PASS-THROUGH" in line:
+                    meta_stats["mode"] = "PASS-THROUGH"
+                    break
+
+            # Director thesis — parse last Stage 1 or Stage 2 log line
+            # Stage 1 format: "DirectorAgent Stage 1: BULLISH [HIGH] | gap=+0.45% ..."
+            # Stage 2 format: "DirectorAgent Stage 2: OVERRIDE BULLISH->BEARISH: ..."
+            #   or confirmed:  "DirectorAgent Stage 2: Stage 2 confirmed BULLISH: ..."
+            for line in reversed(lines[-2000:]):
+                if "DirectorAgent Stage 2:" in line:
+                    _d = line.split("DirectorAgent Stage 2:", 1)[-1].strip()
+                    director_thesis["open_confirmed"] = True
+                    # Override/downgrade/upgrade: extract new bias
+                    _ov_m = _re.search(r"(?:OVERRIDE|DOWNGRADE|UPGRADE)\s+\w+\W+(\w+):", _d)
+                    if _ov_m:
+                        director_thesis["bias"] = _ov_m.group(1)
+                    # Extract pre_bias (first word before →)
+                    _pre_m = _re.search(r"(?:OVERRIDE|DOWNGRADE|UPGRADE)\s+(\w+)", _d)
+                    if _pre_m:
+                        director_thesis["pre_bias"] = _pre_m.group(1)
+                    director_thesis["reasoning"] = _d
+                    break
+
+                if "DirectorAgent Stage 1:" in line and "gap=" in line:
+                    _d = line.split("DirectorAgent Stage 1:", 1)[-1].strip()
+                    _parts = _d.split("|")
+                    _bc_m = _re.match(r"(\w+)\s+\[(\w+)\]", _parts[0].strip())
+                    if _bc_m:
+                        director_thesis["bias"]       = _bc_m.group(1)
+                        director_thesis["confidence"] = _bc_m.group(2)
+                    _gap_m = _re.search(r"gap=([+-]?\d+\.\d+)%", _d)
+                    if _gap_m:
+                        director_thesis["gap_pct"] = float(_gap_m.group(1))
+                    _vix_m = _re.search(r"VIX=([0-9.]+)", _d)
+                    if _vix_m:
+                        director_thesis["vix"] = float(_vix_m.group(1))
+                    _tr_m = _re.search(r"trend=([^|]+)", _d)
+                    if _tr_m:
+                        director_thesis["trend_5d"] = _tr_m.group(1).strip()
+                    if len(_parts) > 1:
+                        director_thesis["reasoning"] = _parts[-1].strip()
+                    break
+        except Exception:
+            pass
+
+    # ── per-strategy signal counts today (fan-out workers → strategy_signals) ──
+    strategy_counts: dict[str, int] = {}
+    daemon_counts:   dict[str, int] = {}
+    try:
+        trading_db = MasterResource.get_trading_db_path()
+        today_date = datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(trading_db, timeout=5)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT strategy, COUNT(*) as cnt FROM strategy_signals "
+            "WHERE DATE(ts) = ? GROUP BY strategy",
+            (today_date,),
+        ).fetchall()
+        strategy_counts = {r["strategy"]: r["cnt"] for r in rows}
+        # Daemon workers write to orders table, not strategy_signals
+        _daemon_strats = (
+            "GammaBlast",
+            "VIXStraddle_CE", "VIXStraddle_PE",
+            "IronCondor_ShortC", "IronCondor_ShortP",
+            "WklyStrangle_ShortC", "WklyStrangle_ShortP",
+            "RedDaySeller_CE",
+        )
+        _ph = ",".join("?" * len(_daemon_strats))
+        d_rows = conn.execute(
+            f"SELECT strategy_name, COUNT(*) as cnt FROM orders "
+            f"WHERE DATE(timestamp) = ? AND strategy_name IN ({_ph}) "
+            f"GROUP BY strategy_name",
+            (today_date, *_daemon_strats),
+        ).fetchall()
+        daemon_counts = {r["strategy_name"]: r["cnt"] for r in d_rows}
+        conn.close()
+    except Exception:
+        pass
+
+    # Combined counts: fan-out from strategy_signals, daemon from orders
+    all_counts = {**strategy_counts, **daemon_counts}
+
+    # ── ChromaDB size + per-strategy win-rate (Phase 3 learning loop) ──
+    kb_count    = 0
+    kb_overall  = {"wins": 0, "losses": 0, "total": 0, "win_rate": 0.0}
+    kb_by_strat: dict[str, dict] = {}
+    try:
+        from rag.knowledge_base import KnowledgeBase
+        kb = KnowledgeBase()
+        kb_count   = kb.count()
+        kb_overall = kb.win_rate()
+        for sid in (
+            # A–K (original)
+            "EMA_9_21", "OptionScalper_EMA44", "Supertrend_MACD",
+            "EMA_VWAP_SR", "ORB_VWAP", "TriplePattern",
+            "IndexMomentum", "BB_MeanReversion",
+            "VWAPReclaim", "CPRBreakout", "PairLeadership",
+            # M–V (Phase 18–19)
+            "Ichimoku", "SMC_FVG_BOS", "FibRetracement",
+            "StochRSI_Div", "MACD_Hist_Div",
+            "ElliotWave", "Harmonic_Pattern", "Candle_Reversal",
+            "Donchian_Breakout", "MultiTF_EMA",
+            # Y + daemon (Phase 22–23)
+            "VWAP_Slope", "GammaBlast",
+        ):
+            wr = kb.win_rate(strategy=sid)
+            if wr["total"] > 0:
+                kb_by_strat[sid] = wr
+    except Exception:
+        pass
+
+    # ── Last nightly_learn run timestamp ──────────────────────────────
+    last_learn = None
+    try:
+        learn_files = sorted(_glob.glob(str(log_dir / "nightly_learn_*.log")))
+        if learn_files:
+            mtime = _os.path.getmtime(learn_files[-1])
+            last_learn = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+    except Exception:
+        pass
+
+    # ── Build worker list (all 28 workers) ──────────────────────────
+    workers = [
+        # ── A–K original 11 ──────────────────────────────────────────
+        {"id": "EMA_9_21",            "label": "A  EMA 9/21",        "regime": "TREND",   "tf": "1m"},
+        {"id": "OptionScalper_EMA44", "label": "B  OptionScalper",   "regime": "TREND",   "tf": "5m"},
+        {"id": "Supertrend_MACD",     "label": "C  Supertrend+MACD", "regime": "TREND",   "tf": "5m"},
+        {"id": "EMA_VWAP_SR",         "label": "D  EMA+VWAP+SR",     "regime": "TREND",   "tf": "1m"},
+        {"id": "ORB_VWAP",            "label": "E  ORB+VWAP",        "regime": "ALL",     "tf": "1m"},
+        {"id": "TriplePattern",       "label": "F  TriplePattern",   "regime": "ALL",     "tf": "5m"},
+        {"id": "IndexMomentum",       "label": "G  IndexMomentum",   "regime": "TREND",   "tf": "1m"},
+        {"id": "BB_MeanReversion",    "label": "H  BB MeanRev",      "regime": "RANGING", "tf": "5m"},
+        {"id": "VWAPReclaim",         "label": "I  VWAPReclaim",     "regime": "ALL",     "tf": "1m"},
+        {"id": "CPRBreakout",         "label": "J  CPRBreakout",     "regime": "TREND",   "tf": "1m"},
+        {"id": "PairLeadership",      "label": "K  PairLeadership",  "regime": "NIFTY",   "tf": "5m"},
+        # ── L disabled ───────────────────────────────────────────────
+        {"id": "MultiStrikeScalp",   "label": "L  MultiStrikeScalp","regime": "ALL",     "tf": "1m",  "disabled": True},
+        # ── M–Q Phase 18 ─────────────────────────────────────────────
+        {"id": "Ichimoku",            "label": "M  Ichimoku",        "regime": "TREND",   "tf": "5m"},
+        {"id": "SMC_FVG_BOS",         "label": "N  SMC FVG+BOS",     "regime": "ALL",     "tf": "5m"},
+        {"id": "FibRetracement",      "label": "O  FibRetracement",  "regime": "TREND",   "tf": "5m"},
+        {"id": "StochRSI_Div",        "label": "P  StochRSI Div",    "regime": "RANGING", "tf": "5m"},
+        {"id": "MACD_Hist_Div",       "label": "Q  MACD Hist Div",   "regime": "TREND",   "tf": "5m"},
+        # ── R–V Phase 19 ─────────────────────────────────────────────
+        {"id": "ElliotWave",          "label": "R  ElliotWave",      "regime": "TREND",   "tf": "5m"},
+        {"id": "Harmonic_Pattern",    "label": "S  Harmonic",        "regime": "ALL",     "tf": "5m"},
+        {"id": "Candle_Reversal",     "label": "T  CandleReversal",  "regime": "ALL",     "tf": "5m"},
+        {"id": "Donchian_Breakout",   "label": "U  Donchian",        "regime": "TREND",   "tf": "5m"},
+        {"id": "MultiTF_EMA",         "label": "V  MultiTF EMA",     "regime": "TREND",   "tf": "5m+15m"},
+        # ── W–Y Phase 22 ─────────────────────────────────────────────
+        {"id": "VIXStraddle_CE",      "label": "W  VIX Straddle",    "regime": "VIX<25",  "tf": "DAEMON"},
+        {"id": "IronCondor_ShortC",   "label": "X  Iron Condor",     "regime": "VIX>75",  "tf": "DAEMON"},
+        {"id": "VWAP_Slope",          "label": "Y  VWAP Slope",      "regime": "ALL",     "tf": "1m"},
+        # ── Z1–Z2 Phase 23 ───────────────────────────────────────────
+        {"id": "WklyStrangle_ShortC", "label": "Z1 WklyStrangle",    "regime": "VIX<20",  "tf": "DAEMON"},
+        {"id": "RedDaySeller_CE",     "label": "Z2 RedDaySeller",    "regime": "RED DAY", "tf": "DAEMON"},
+        # ── GammaBlast daemon ─────────────────────────────────────────
+        {"id": "GammaBlast",          "label": "GB GammaBlast",      "regime": "EXPIRY",  "tf": "DAEMON"},
+    ]
+    for w in workers:
+        w["signals_today"] = all_counts.get(w["id"], 0)
+        wr = kb_by_strat.get(w["id"])
+        w["kb_win_rate"] = wr["win_rate"] if wr else None
+        w["kb_total"]    = wr["total"]    if wr else 0
+
+    return jsonify({
+        "engine_alive":    engine_alive,
+        "engine_last":     engine_last,
+        "meta_stats":      meta_stats,
+        "director_thesis": director_thesis,
+        "workers":         workers,
+        "kb_count":        kb_count,
+        "kb_overall":      kb_overall,
+        "last_learn":      last_learn,
+        "server_time":     datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+@app.route("/api/analytics")
+def api_analytics():
+    """
+    Signal & strategy analytics from whatif_trades (reliable simulated P&L).
+    ?days=7|30|90|0  (0 = all time, default 30)
+    """
+    from flask import request as _req
+    days = int(_req.args.get("days", 30))
+
+    _ALGO_STRATEGIES = {
+        # A–K
+        "EMA_9_21", "OptionScalper_EMA44", "Supertrend_MACD", "EMA_VWAP_SR",
+        "ORB_VWAP", "TriplePattern", "IndexMomentum", "BB_MeanReversion",
+        "VWAPReclaim", "CPRBreakout", "PairLeadership",
+        # L–V (Phase 16–19)
+        "MultiStrikeScalp", "Ichimoku", "SMC_FVG_BOS", "FibRetracement",
+        "StochRSI_Div", "MACD_Hist_Div", "ElliotWave", "Harmonic_Pattern",
+        "Candle_Reversal", "Donchian_Breakout", "MultiTF_EMA",
+        # Y + daemons (Phase 22–23)
+        "VWAP_Slope", "GammaBlast",
+        "VIXStraddle_CE", "VIXStraddle_PE",
+        "IronCondor_ShortC", "IronCondor_ShortP",
+        "WklyStrangle_ShortC", "WklyStrangle_ShortP",
+        "RedDaySeller_CE",
+    }
+
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+        date_filter = (
+            f"AND run_date >= date('now', '-{days} days')" if days > 0 else ""
+        )
+
+        # ── Per source (channel or strategy) stats ───────────────────────────
+        rows = conn.execute(f"""
+            SELECT channel_name,
+                   COUNT(*)                                                    AS signals,
+                   SUM(CASE WHEN result='PROFIT' THEN 1 ELSE 0 END)           AS wins,
+                   SUM(CASE WHEN result='LOSS'   THEN 1 ELSE 0 END)           AS losses,
+                   ROUND(SUM(CASE WHEN pnl_total IS NOT NULL THEN pnl_total ELSE 0 END), 2) AS total_pnl,
+                   ROUND(AVG(CASE WHEN pnl_total IS NOT NULL THEN pnl_total END), 2)        AS avg_pnl,
+                   ROUND(AVG(CASE WHEN pnl_pct   IS NOT NULL THEN pnl_pct   END), 2)        AS avg_pnl_pct,
+                   ROUND(MAX(CASE WHEN pnl_total IS NOT NULL THEN pnl_total END), 2)        AS best_trade,
+                   ROUND(MIN(CASE WHEN pnl_total IS NOT NULL THEN pnl_total END), 2)        AS worst_trade,
+                   MIN(run_date) AS first_date, MAX(run_date) AS last_date,
+                   COUNT(CASE WHEN data_quality='LIVE' OR data_quality IS NULL THEN 1 END) AS live_data_count
+            FROM   whatif_trades
+            WHERE  1=1 {date_filter}
+            GROUP  BY channel_name
+            ORDER  BY total_pnl DESC
+        """).fetchall()
+
+        channels = []
+        strategies = []
+        for r in rows:
+            d = dict(r)
+            wins  = d["wins"]   or 0
+            total = d["signals"] or 1
+            d["win_rate"] = round(wins / total * 100, 1)
+            # Grade: A=win≥55%+pnl>0 / B=win≥45%+pnl>0 / C=win≥35% / D=else
+            p = d["total_pnl"] or 0
+            wr = d["win_rate"]
+            if wr >= 55 and p > 0:       d["grade"] = "A"
+            elif wr >= 45 and p > 0:     d["grade"] = "B"
+            elif wr >= 35 and p >= 0:    d["grade"] = "C"
+            elif p > 0:                  d["grade"] = "C+"  # low win rate but profitable
+            else:                        d["grade"] = "D"
+            if d["channel_name"] in _ALGO_STRATEGIES:
+                strategies.append(d)
+            else:
+                channels.append(d)
+
+        # ── Per-symbol breakdown ──────────────────────────────────────────────
+        sym_rows = conn.execute(f"""
+            SELECT symbol,
+                   COUNT(*) AS signals,
+                   SUM(CASE WHEN result='PROFIT' THEN 1 ELSE 0 END) AS wins,
+                   ROUND(SUM(CASE WHEN pnl_total IS NOT NULL THEN pnl_total ELSE 0 END), 2) AS total_pnl,
+                   ROUND(AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct END), 2) AS avg_pct
+            FROM   whatif_trades
+            WHERE  1=1 {date_filter}
+            GROUP  BY symbol
+            ORDER  BY total_pnl DESC
+            LIMIT  20
+        """).fetchall()
+        symbols = []
+        for r in sym_rows:
+            d = dict(r)
+            d["win_rate"] = round((d["wins"] or 0) / max(d["signals"] or 1, 1) * 100, 1)
+            symbols.append(d)
+
+        # ── Strategy signals fired today / all-time (from strategy_signals) ──
+        sig_counts = {}
+        try:
+            sc_rows = conn.execute("""
+                SELECT strategy, COUNT(*) AS cnt, SUM(CASE WHEN signal!='HOLD' THEN 1 ELSE 0 END) AS fires
+                FROM strategy_signals GROUP BY strategy
+            """).fetchall()
+            sig_counts = {r["strategy"]: {"total": r["cnt"], "fires": r["fires"]} for r in sc_rows}
+        except Exception:
+            pass
+
+        for s in strategies:
+            sc = sig_counts.get(s["channel_name"], {})
+            s["ss_fires"] = sc.get("fires", None)
+
+        # ── Overall summary ───────────────────────────────────────────────────
+        overall = conn.execute(f"""
+            SELECT COUNT(*) AS total_signals,
+                   SUM(CASE WHEN result='PROFIT' THEN 1 ELSE 0 END) AS wins,
+                   ROUND(SUM(CASE WHEN pnl_total IS NOT NULL THEN pnl_total ELSE 0 END), 2) AS total_pnl,
+                   MIN(run_date) AS first_date, MAX(run_date) AS last_date
+            FROM   whatif_trades WHERE 1=1 {date_filter}
+        """).fetchone()
+        ov = dict(overall) if overall else {}
+        ov["win_rate"] = round((ov.get("wins") or 0) / max(ov.get("total_signals") or 1, 1) * 100, 1)
+
+        conn.close()
+        return jsonify({
+            "channels":   channels,
+            "strategies": strategies,
+            "symbols":    symbols,
+            "overall":    ov,
+            "days":       days,
+        })
+    except Exception as e:
+        logger.error(f"api_analytics error: {e}")
+        return jsonify({"channels": [], "strategies": [], "symbols": [], "overall": {}, "days": days})
+
+
+@app.route("/api/director_history")
+def api_director_history():
+    """Director thesis log for a given date. ?date=YYYY-MM-DD (default: today)."""
+    from flask import request as _req
+    dt = _req.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, ts, trade_date, stage, bias, confidence, gap_pct, vix,
+                   trend_5d, pre_bias, override_type, reasoning
+            FROM   director_log
+            WHERE  trade_date = ?
+            ORDER  BY ts, stage
+        """, (dt,)).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        logger.error(f"api_director_history error: {e}")
+        return jsonify([])
+
+
+@app.route("/api/director_summary")
+def api_director_summary():
+    """Per-day director summary: pre-market bias vs final bias, override count."""
+    try:
+        conn = sqlite3.connect(str(MasterResource.get_trading_db_path()), timeout=10)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT trade_date,
+                   MAX(CASE WHEN stage=1 THEN bias       END) AS pre_bias,
+                   MAX(CASE WHEN stage=1 THEN confidence END) AS pre_conf,
+                   MAX(CASE WHEN stage=1 THEN gap_pct    END) AS gap_pct,
+                   MAX(CASE WHEN stage=2 THEN bias       END) AS final_bias,
+                   MAX(CASE WHEN stage=2 THEN override_type END) AS last_override,
+                   SUM(CASE WHEN stage=2 AND override_type NOT IN ('CONFIRMED') THEN 1 ELSE 0 END) AS override_count,
+                   COUNT(CASE WHEN stage=2 THEN 1 END)       AS s2_count
+            FROM   director_log
+            GROUP  BY trade_date
+            ORDER  BY trade_date DESC
+            LIMIT  30
+        """).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception as e:
+        logger.error(f"api_director_summary error: {e}")
+        return jsonify([])
+
+
+@app.route("/api/swing")
+def api_swing():
+    """
+    Return swing trading summary:
+      - active positions with current P&L
+      - recent watchlist (last 7 days)
+      - closed trades summary (win rate, avg P&L)
+    """
+    try:
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        # Active positions
+        active_rows = con.execute("""
+            SELECT symbol, entry_date, entry_price, qty, sl, target, trail_sl,
+                   peak_price, atr14_at_entry, setup_type, created_at,
+                   ROUND((target - entry_price) / entry_price * 100, 1) AS target_pct,
+                   ROUND((entry_price - sl)     / entry_price * 100, 1) AS sl_pct,
+                   CAST(julianday('now') - julianday(entry_date) AS INTEGER)  AS days_held
+            FROM swing_positions WHERE state = 'ACTIVE'
+            ORDER BY entry_date DESC
+        """).fetchall()
+
+        # Watchlist (last 7 days)
+        wl_rows = con.execute("""
+            SELECT symbol, scan_date, setup_type, trigger_price, sl, target,
+                   confidence, status, notes
+            FROM swing_watchlist
+            WHERE scan_date >= date('now', '-7 days')
+            ORDER BY confidence DESC, scan_date DESC
+            LIMIT 50
+        """).fetchall()
+
+        # Closed trade stats (all time)
+        stats = con.execute("""
+            SELECT
+                COUNT(*)                                       AS total,
+                SUM(CASE WHEN state='CLOSED_PROFIT'  THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN state='CLOSED_LOSS'    THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN state='CLOSED_TIMEOUT' THEN 1 ELSE 0 END) AS timeouts,
+                ROUND(AVG(pnl_pct), 2)                        AS avg_pnl_pct,
+                ROUND(SUM(pnl_abs), 2)                        AS total_pnl,
+                ROUND(MAX(pnl_pct), 2)                        AS best_pct,
+                ROUND(MIN(pnl_pct), 2)                        AS worst_pct
+            FROM swing_positions
+            WHERE state IN ('CLOSED_PROFIT', 'CLOSED_LOSS', 'CLOSED_TIMEOUT')
+        """).fetchone()
+
+        # Recent closed positions (last 30 days)
+        closed_rows = con.execute("""
+            SELECT symbol, entry_date, exit_date, entry_price, exit_price,
+                   pnl_pct, pnl_abs, exit_reason, setup_type, state
+            FROM swing_positions
+            WHERE state IN ('CLOSED_PROFIT', 'CLOSED_LOSS', 'CLOSED_TIMEOUT')
+              AND exit_date >= date('now', '-30 days')
+            ORDER BY exit_date DESC
+            LIMIT 30
+        """).fetchall()
+
+        con.close()
+
+        stats_d = dict(stats) if stats else {}
+        win_rate = (
+            round(stats_d.get("wins", 0) / stats_d["total"] * 100, 1)
+            if stats_d.get("total", 0) > 0 else 0.0
+        )
+
+        return jsonify({
+            "active":   [dict(r) for r in active_rows],
+            "watchlist":[dict(r) for r in wl_rows],
+            "closed":   [dict(r) for r in closed_rows],
+            "stats":    {**stats_d, "win_rate_pct": win_rate},
+        })
+
+    except Exception as e:
+        logger.error(f"api_swing error: {e}")
+        return jsonify({"active": [], "watchlist": [], "closed": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/api/fa")
+def api_fa():
+    """
+    Return FA paper portfolio summary:
+      - active positions with current return and alpha
+      - top recent snapshots (last scored)
+      - closed positions summary (win rate, avg return, avg alpha)
+    """
+    try:
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        # Active positions
+        active_rows = con.execute("""
+            SELECT symbol, add_date, entry_price, score,
+                   abs_return_pct, alpha_pct, thesis
+              FROM fa_portfolio
+             WHERE status = 'ACTIVE'
+             ORDER BY score DESC
+        """).fetchall()
+
+        # Last 30 score snapshots
+        snapshot_rows = con.execute("""
+            SELECT symbol, scored_at, composite, recommend, data_quality, thesis
+              FROM fa_score_snapshot
+             ORDER BY scored_at DESC, composite DESC
+             LIMIT 30
+        """).fetchall()
+
+        # Closed stats
+        stats = con.execute("""
+            SELECT
+                COUNT(*)                                                 AS total,
+                SUM(CASE WHEN abs_return_pct > 0 THEN 1 ELSE 0 END)    AS wins,
+                SUM(CASE WHEN abs_return_pct <= 0 THEN 1 ELSE 0 END)   AS losses,
+                ROUND(AVG(abs_return_pct), 2)                           AS avg_ret_pct,
+                ROUND(AVG(alpha_pct), 2)                                AS avg_alpha_pct,
+                ROUND(SUM(abs_return_pct), 2)                           AS total_ret_pct
+              FROM fa_portfolio
+             WHERE status = 'CLOSED'
+               AND abs_return_pct IS NOT NULL
+        """).fetchone()
+
+        # Recent closed (last 90 days)
+        closed_rows = con.execute("""
+            SELECT symbol, add_date, close_date, entry_price, close_price,
+                   score, abs_return_pct, alpha_pct
+              FROM fa_portfolio
+             WHERE status = 'CLOSED'
+               AND close_date >= date('now', '-90 days')
+             ORDER BY close_date DESC
+             LIMIT 30
+        """).fetchall()
+
+        con.close()
+
+        def _row(r):
+            return dict(r)
+
+        stats_d = dict(stats) if stats else {}
+        total   = stats_d.get("total") or 0
+        wins    = stats_d.get("wins") or 0
+        win_rate = round(wins / total * 100, 1) if total else 0.0
+
+        return jsonify({
+            "active":    [_row(r) for r in active_rows],
+            "snapshots": [_row(r) for r in snapshot_rows],
+            "closed":    [_row(r) for r in closed_rows],
+            "stats":     {**stats_d, "win_rate_pct": win_rate},
+        })
+
+    except Exception as e:
+        logger.error(f"api_fa error: {e}")
+        return jsonify({"active": [], "snapshots": [], "closed": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/api/anomalies")
+def api_anomalies():
+    """Real-time price/volume anomaly alerts for FnO stocks (Engine A)."""
+    try:
+        from flask import request as _req
+        limit  = int(_req.args.get("limit", 100))
+        hours  = int(_req.args.get("hours", 24))
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        alerts = con.execute("""
+            SELECT symbol, security_id, detected_at, alert_type,
+                   ltp, prev_close, price_chg_pct,
+                   session_volume, vol20, vol_ratio, atr14
+              FROM anomaly_alerts
+             WHERE detected_at >= datetime('now', ?, 'localtime')
+             ORDER BY detected_at DESC
+             LIMIT ?
+        """, (f"-{hours} hours", limit)).fetchall()
+
+        stats = con.execute("""
+            SELECT
+                COUNT(*)                                              AS total,
+                SUM(CASE WHEN alert_type='COMBINED'   THEN 1 ELSE 0 END) AS combined,
+                SUM(CASE WHEN alert_type='PRICE_UP'   THEN 1 ELSE 0 END) AS price_up,
+                SUM(CASE WHEN alert_type='PRICE_DOWN' THEN 1 ELSE 0 END) AS price_down,
+                SUM(CASE WHEN alert_type='VOL_SPIKE'  THEN 1 ELSE 0 END) AS vol_spike
+              FROM anomaly_alerts
+             WHERE detected_at >= datetime('now', ?, 'localtime')
+        """, (f"-{hours} hours",)).fetchone()
+
+        con.close()
+        return jsonify({
+            "alerts": [dict(r) for r in alerts],
+            "stats":  dict(stats) if stats else {},
+            "hours":  hours,
+        })
+    except Exception as e:
+        logger.error(f"api_anomalies error: {e}")
+        return jsonify({"alerts": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/api/risk_flags")
+def api_risk_flags():
+    """Non-FnO open position risk flags (Engine B)."""
+    try:
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        active = con.execute("""
+            SELECT symbol, security_id, flagged_at, position_qty,
+                   product_type, avg_price, flag_reason
+              FROM risk_flags
+             WHERE status = 'ACTIVE'
+             ORDER BY flagged_at DESC
+        """).fetchall()
+
+        cleared = con.execute("""
+            SELECT symbol, flagged_at, cleared_at, position_qty, avg_price
+              FROM risk_flags
+             WHERE status = 'CLEARED'
+               AND cleared_at >= date('now', '-7 days')
+             ORDER BY cleared_at DESC
+             LIMIT 20
+        """).fetchall()
+
+        con.close()
+        return jsonify({
+            "active":  [dict(r) for r in active],
+            "cleared": [dict(r) for r in cleared],
+        })
+    except Exception as e:
+        logger.error(f"api_risk_flags error: {e}")
+        return jsonify({"active": [], "cleared": [], "error": str(e)})
+
+
+@app.route("/api/patterns")
+def api_patterns():
+    """
+    Multi-timeframe candlestick pattern alerts for FnO equity stocks (Phase 6C).
+
+    Query params:
+      ?hours=24       – lookback window in hours (default 24)
+      ?tf=1M          – filter by timeframe: 1M, 5M, 1H, 4H, or 'all' (default)
+      ?dir=BULLISH    – filter by direction: BULLISH, BEARISH, NEUTRAL, or 'all'
+      ?limit=200      – max rows returned (default 200)
+    """
+    try:
+        hours  = int(request.args.get("hours",  24))
+        tf     = request.args.get("tf",  "all").upper()
+        dirn   = request.args.get("dir", "all").upper()
+        limit  = int(request.args.get("limit", 200))
+
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        # Check table exists
+        tbl = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='pattern_alerts'"
+        ).fetchone()
+        if not tbl:
+            con.close()
+            return jsonify({"alerts": [], "stats": {}, "error": "pattern_alerts table not yet created"})
+
+        where  = ["detected_at >= datetime('now', ?, 'localtime')"]
+        params: list = [f"-{hours} hours"]
+        if tf  != "ALL":
+            where.append("timeframe = ?");  params.append(tf)
+        if dirn != "ALL":
+            where.append("direction = ?");  params.append(dirn)
+        params.append(limit)
+
+        alerts = con.execute(
+            f"""SELECT symbol, timeframe, pattern, direction, confidence,
+                       candle_time, entry, stop, target, rr,
+                       ema21, htf_trend, vol_ratio, detected_at
+                  FROM pattern_alerts
+                 WHERE {' AND '.join(where)}
+                 ORDER BY detected_at DESC, confidence DESC
+                 LIMIT ?""",
+            params,
+        ).fetchall()
+
+        # Stats
+        stats_rows = con.execute(
+            """SELECT direction, timeframe, COUNT(*) as cnt
+                 FROM pattern_alerts
+                WHERE detected_at >= datetime('now', ?, 'localtime')
+                GROUP BY direction, timeframe""",
+            [f"-{hours} hours"],
+        ).fetchall()
+        con.close()
+
+        stats: dict = {"total": 0, "bullish": 0, "bearish": 0, "by_tf": {}}
+        for r in stats_rows:
+            stats["total"] += r["cnt"]
+            if r["direction"] == "BULLISH":
+                stats["bullish"] += r["cnt"]
+            elif r["direction"] == "BEARISH":
+                stats["bearish"] += r["cnt"]
+            tf_key = r["timeframe"]
+            stats["by_tf"][tf_key] = stats["by_tf"].get(tf_key, 0) + r["cnt"]
+
+        return jsonify({
+            "alerts": [dict(r) for r in alerts],
+            "stats":  stats,
+        })
+    except Exception as e:
+        logger.error(f"api_patterns error: {e}")
+        return jsonify({"alerts": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/api/commodities")
+def api_commodities():
+    """
+    Commodity signals for 5 MCX mini contracts (Phase 6A).
+
+    Query params:
+      ?hours=24      – lookback window in hours (default 24)
+      ?dir=BULLISH   – filter by direction: BULLISH, BEARISH, or 'all' (default)
+      ?status=ACTIVE – filter by status: ACTIVE, STALE, or 'all' (default ACTIVE)
+      ?limit=200     – max rows returned (default 200)
+    """
+    try:
+        hours  = int(request.args.get("hours",  24))
+        dirn   = request.args.get("dir",    "all").upper()
+        status = request.args.get("status", "ACTIVE").upper()
+        limit  = int(request.args.get("limit", 200))
+
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        tbl = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='commodity_signals'"
+        ).fetchone()
+        if not tbl:
+            con.close()
+            return jsonify({"signals": [], "stats": {},
+                            "error": "commodity_signals table not yet created"})
+
+        where  = ["detected_at >= datetime('now', ?, 'localtime')"]
+        params: list = [f"-{hours} hours"]
+        if dirn != "ALL":
+            where.append("direction = ?");  params.append(dirn)
+        if status != "ALL":
+            where.append("status = ?");     params.append(status)
+        params.append(limit)
+
+        signals = con.execute(
+            f"""SELECT symbol, category, direction, score,
+                       entry_price, stop_price, target_1, target_2, risk_reward,
+                       ema_signal, st_signal, vwap_signal, orb_signal, dxy_signal,
+                       atr14, vwap_price, orb_high, orb_low,
+                       eia_blocked, data_source, detected_at, status
+                  FROM commodity_signals
+                 WHERE {' AND '.join(where)}
+                 ORDER BY detected_at DESC, ABS(score) DESC
+                 LIMIT ?""",
+            params,
+        ).fetchall()
+
+        stats_rows = con.execute(
+            """SELECT direction, COUNT(*) as cnt, AVG(ABS(score)) as avg_score
+                 FROM commodity_signals
+                WHERE detected_at >= datetime('now', ?, 'localtime')
+                GROUP BY direction""",
+            [f"-{hours} hours"],
+        ).fetchall()
+
+        # Latest price snapshot per symbol (most recent signal)
+        latest = con.execute(
+            """SELECT symbol, entry_price, direction, score, detected_at
+                 FROM commodity_signals
+                WHERE detected_at >= datetime('now', '-48 hours', 'localtime')
+                ORDER BY detected_at DESC""",
+        ).fetchall()
+        con.close()
+
+        # De-dup: one row per symbol (most recent)
+        seen: set = set()
+        snapshot: list = []
+        for r in latest:
+            if r["symbol"] not in seen:
+                seen.add(r["symbol"])
+                snapshot.append(dict(r))
+
+        stats: dict = {"total": 0, "bullish": 0, "bearish": 0}
+        for r in stats_rows:
+            stats["total"] += r["cnt"]
+            if r["direction"] == "BULLISH":
+                stats["bullish"] += r["cnt"]
+            elif r["direction"] == "BEARISH":
+                stats["bearish"] += r["cnt"]
+
+        return jsonify({
+            "signals":  [dict(r) for r in signals],
+            "snapshot": snapshot,
+            "stats":    stats,
+        })
+    except Exception as e:
+        logger.error(f"api_commodities error: {e}")
+        return jsonify({"signals": [], "snapshot": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/api/commodity_paper_trades")
+def api_commodity_paper_trades():
+    """Paper trade performance tracking for MCX commodity signals."""
+    try:
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        tbl = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='commodity_paper_trades'"
+        ).fetchone()
+        if not tbl:
+            con.close()
+            return jsonify({"open": [], "closed": [], "stats": {}, "by_symbol": [],
+                            "error": "commodity_paper_trades table not yet created"})
+
+        open_trades = con.execute("""
+            SELECT id, symbol, direction, score, entry_price, stop_price,
+                   target_1, target_2, risk_pts, opened_at,
+                   ema_signal, st_signal, vwap_signal, orb_signal, dxy_signal,
+                   eia_blocked, data_source
+            FROM commodity_paper_trades
+            WHERE status='OPEN'
+            ORDER BY opened_at DESC
+        """).fetchall()
+
+        closed_trades = con.execute("""
+            SELECT id, symbol, direction, score, entry_price, exit_price,
+                   exit_reason, pnl_pts, r_multiple, opened_at, closed_at,
+                   ema_signal, st_signal, vwap_signal, orb_signal, dxy_signal,
+                   eia_blocked, data_source
+            FROM commodity_paper_trades
+            WHERE status != 'OPEN'
+            ORDER BY closed_at DESC
+            LIMIT 100
+        """).fetchall()
+
+        agg = con.execute("""
+            SELECT
+              COUNT(*)                                                          AS total,
+              SUM(CASE WHEN status='OPEN'              THEN 1 ELSE 0 END)      AS open_ct,
+              SUM(CASE WHEN status IN('TP1_HIT','TP2_HIT') THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN status='SL_HIT'            THEN 1 ELSE 0 END)      AS losses,
+              SUM(CASE WHEN status='EXPIRED'           THEN 1 ELSE 0 END)      AS expired,
+              AVG(CASE WHEN status!='OPEN' THEN r_multiple END)                AS avg_r,
+              AVG(CASE WHEN status IN('TP1_HIT','TP2_HIT') THEN r_multiple END) AS avg_win_r,
+              SUM(CASE WHEN status='SL_HIT' THEN r_multiple ELSE 0 END)        AS total_loss_r,
+              SUM(CASE WHEN status IN('TP1_HIT','TP2_HIT') THEN r_multiple ELSE 0 END) AS total_win_r
+            FROM commodity_paper_trades
+        """).fetchone()
+
+        by_symbol = con.execute("""
+            SELECT symbol,
+                   COUNT(*)                                                         AS total,
+                   SUM(CASE WHEN status IN('TP1_HIT','TP2_HIT') THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN status='SL_HIT'                THEN 1 ELSE 0 END) AS losses,
+                   AVG(CASE WHEN status!='OPEN' THEN r_multiple END)               AS avg_r
+            FROM commodity_paper_trades
+            WHERE status != 'OPEN'
+            GROUP BY symbol
+            ORDER BY wins DESC
+        """).fetchall()
+
+        by_score = con.execute("""
+            SELECT score,
+                   COUNT(*)                                                         AS total,
+                   SUM(CASE WHEN status IN('TP1_HIT','TP2_HIT') THEN 1 ELSE 0 END) AS wins,
+                   AVG(CASE WHEN status!='OPEN' THEN r_multiple END)               AS avg_r
+            FROM commodity_paper_trades
+            WHERE status != 'OPEN'
+            GROUP BY score
+            ORDER BY ABS(score) DESC
+        """).fetchall()
+
+        con.close()
+
+        resolved = (agg["wins"] or 0) + (agg["losses"] or 0)
+        win_rate  = round((agg["wins"] or 0) / resolved * 100, 1) if resolved > 0 else None
+        exp_val   = round(((agg["total_win_r"] or 0) + (agg["total_loss_r"] or 0)) / resolved, 2) \
+                    if resolved > 0 else None
+
+        return jsonify({
+            "open":      [dict(r) for r in open_trades],
+            "closed":    [dict(r) for r in closed_trades],
+            "by_symbol": [dict(r) for r in by_symbol],
+            "by_score":  [dict(r) for r in by_score],
+            "stats": {
+                "total":    agg["total"]   or 0,
+                "open":     agg["open_ct"] or 0,
+                "wins":     agg["wins"]    or 0,
+                "losses":   agg["losses"]  or 0,
+                "expired":  agg["expired"] or 0,
+                "resolved": resolved,
+                "win_rate": win_rate,
+                "avg_r":    round(agg["avg_r"],    2) if agg["avg_r"]    else None,
+                "avg_win_r":round(agg["avg_win_r"],2) if agg["avg_win_r"] else None,
+                "exp_val":  exp_val,
+            },
+        })
+    except Exception as e:
+        logger.error(f"api_commodity_paper_trades error: {e}")
+        return jsonify({"open": [], "closed": [], "stats": {}, "by_symbol": [],
+                        "by_score": [], "error": str(e)})
+
+
+@app.route("/api/leading_signals")
+def api_leading_signals():
+    """
+    Leading Indicator Engine signals and snapshots (Phase 7A).
+
+    Query params:
+      ?hours=24    – lookback window in hours (default 24)
+      ?index=NIFTY – filter by index (default: all)
+    """
+    try:
+        from core.leading_store import _conn as _lconn
+        hours   = int(request.args.get("hours", 24))
+        index_f = request.args.get("index", "all")
+        cutoff  = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+        con = _lconn()
+
+        # Signals
+        sig_q = "SELECT * FROM leading_signals WHERE detected_at >= ?"
+        sig_p: list = [cutoff]
+        if index_f != "all":
+            sig_q += " AND index_name=?"
+            sig_p.append(index_f)
+        sig_q += " ORDER BY detected_at DESC LIMIT 200"
+        sigs  = [dict(r) for r in con.execute(sig_q, sig_p).fetchall()]
+
+        # Latest snapshot per index
+        snaps_raw = con.execute(
+            "SELECT s.* FROM leading_snapshots s "
+            "INNER JOIN (SELECT index_name, MAX(snapped_at) ma "
+            "            FROM leading_snapshots GROUP BY index_name) t "
+            "ON s.index_name=t.index_name AND s.snapped_at=t.ma"
+        ).fetchall()
+        snaps = [dict(r) for r in snaps_raw]
+
+        # Quick stats
+        total_sigs = len(sigs)
+        breakouts  = sum(1 for s in sigs if s["signal_type"] == "Leading_Breakout")
+        reversals  = total_sigs - breakouts
+        avg_conf   = round(sum(s["confidence_score"] for s in sigs) / total_sigs, 1) if total_sigs else 0
+
+        con.close()
+        return jsonify({
+            "signals":   sigs,
+            "snapshots": snaps,
+            "stats": {
+                "total":      total_sigs,
+                "breakouts":  breakouts,
+                "reversals":  reversals,
+                "avg_conf":   avg_conf,
+                "hours":      hours,
+            }
+        })
+    except Exception as e:
+        logger.error(f"api_leading_signals error: {e}")
+        return jsonify({"signals": [], "snapshots": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/api/pa_setups")
+def api_pa_setups():
+    """
+    Price Action setups for FnO equity stocks (Phase 6B).
+
+    Query params:
+      ?hours=48       – lookback window in hours (default 48)
+      ?dir=BULLISH    – filter by direction: BULLISH, BEARISH, or 'all' (default)
+      ?conf=1         – minimum confidence 1–3 (default 1)
+      ?status=ACTIVE  – filter by status: ACTIVE, TRIGGERED, STALE, or 'all' (default)
+      ?limit=200      – max rows returned (default 200)
+    """
+    try:
+        hours  = int(request.args.get("hours",  48))
+        dirn   = request.args.get("dir",    "all").upper()
+        conf   = int(request.args.get("conf",   1))
+        status = request.args.get("status", "all").upper()
+        limit  = int(request.args.get("limit", 200))
+
+        trading_db = str(Path(MasterResource.MASTER_ROOT) / "data" / "trading.db")
+        con = sqlite3.connect(trading_db, timeout=10)
+        con.row_factory = sqlite3.Row
+
+        for tbl in ("pa_setups", "pa_zones"):
+            row = con.execute(
+                f"SELECT name FROM sqlite_master WHERE type='table' AND name='{tbl}'"
+            ).fetchone()
+            if not row:
+                con.close()
+                return jsonify({"setups": [], "zones": [], "stats": {},
+                                "error": f"{tbl} table not yet created"})
+
+        where  = ["detected_at >= datetime('now', ?, 'localtime')", "confidence >= ?"]
+        params: list = [f"-{hours} hours", conf]
+        if dirn != "ALL":
+            where.append("direction = ?");  params.append(dirn)
+        if status != "ALL":
+            where.append("status = ?");     params.append(status)
+        params.append(limit)
+
+        setups = con.execute(
+            f"""SELECT symbol, setup_type, direction, htf_struct,
+                       entry_price, stop_price, target_1, target_2, risk_reward,
+                       zone_high, zone_low, zone_type, confidence, details,
+                       detected_at, status
+                  FROM pa_setups
+                 WHERE {' AND '.join(where)}
+                 ORDER BY detected_at DESC, confidence DESC
+                 LIMIT ?""",
+            params,
+        ).fetchall()
+
+        zones = con.execute(
+            """SELECT symbol, timeframe, zone_type, zone_high, zone_low,
+                      impulse_pct, bar_time, created_at, status, tested_count
+                 FROM pa_zones
+                WHERE status != 'BROKEN'
+                ORDER BY created_at DESC
+                LIMIT 500""",
+        ).fetchall()
+
+        stats_rows = con.execute(
+            """SELECT direction, confidence, COUNT(*) as cnt
+                 FROM pa_setups
+                WHERE detected_at >= datetime('now', ?, 'localtime')
+                GROUP BY direction, confidence""",
+            [f"-{hours} hours"],
+        ).fetchall()
+        con.close()
+
+        stats: dict = {"total": 0, "bullish": 0, "bearish": 0, "high_conf": 0}
+        for r in stats_rows:
+            stats["total"] += r["cnt"]
+            if r["direction"] == "BULLISH":
+                stats["bullish"] += r["cnt"]
+            elif r["direction"] == "BEARISH":
+                stats["bearish"] += r["cnt"]
+            if r["confidence"] >= 3:
+                stats["high_conf"] += r["cnt"]
+
+        setups_list = []
+        for r in setups:
+            d = dict(r)
+            try:
+                d["details"] = json.loads(d["details"]) if d["details"] else {}
+            except Exception:
+                d["details"] = {}
+            setups_list.append(d)
+
+        return jsonify({
+            "setups": setups_list,
+            "zones":  [dict(r) for r in zones],
+            "stats":  stats,
+        })
+    except Exception as e:
+        logger.error(f"api_pa_setups error: {e}")
+        return jsonify({"setups": [], "zones": [], "stats": {}, "error": str(e)})
+
+
+@app.route("/")
+def index():
+    return render_template("dashboard.html")
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    logger.info("=" * 60)
+    logger.info("  Dhan Account Dashboard starting")
+    logger.info(f"  Mode   : {'SANDBOX' if IS_SANDBOX else 'LIVE'}")
+    logger.info(f"  Poll   : every {POLL_INTERVAL}s")
+    logger.info(f"  DB     : {DB_PATH}")
+    logger.info(f"  Open   : http://127.0.0.1:5050")
+    logger.info("=" * 60)
+
+    print("=" * 60)
+    print("  Dhan Account Dashboard")
+    print(f"  Mode   : {'SANDBOX' if IS_SANDBOX else 'LIVE'}")
+    print(f"  Poll   : every {POLL_INTERVAL}s")
+    print(f"  DB     : {DB_PATH}")
+    print(f"  Open   : http://127.0.0.1:5050")
+    print("=" * 60)
+
+    _init_db()
+    _init_trading_db()
+
+    def _heartbeat_loop():
+        while True:
+            time.sleep(120)
+            logger.info("[HEARTBEAT] Dashboard alive")
+
+    poller = threading.Thread(target=_poll_loop, daemon=True, name="DhanPoller")
+    poller.start()
+
+    hb = threading.Thread(target=_heartbeat_loop, daemon=True, name="DhanHeartbeat")
+    hb.start()
+
+    app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False, threaded=True)

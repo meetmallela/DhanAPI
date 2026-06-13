@@ -1,0 +1,441 @@
+"""
+db_utils.py - Thread-safe SQLite database utilities
+
+Provides safe concurrent access to SQLite databases across multiple processes.
+Uses connection-per-operation pattern with retry logic for locked databases.
+
+Features:
+- Thread-safe operations with per-database locks
+- WAL mode for better concurrent read/write
+- Automatic retry with exponential backoff for locked databases
+- Transaction support with automatic rollback on failure
+"""
+
+import sqlite3
+import threading
+import time
+import logging
+import json
+from contextlib import contextmanager
+from datetime import datetime
+
+# Global locks for write operations (one per database file)
+_db_locks = {}
+_locks_lock = threading.Lock()
+
+# Transaction status tracking
+class TransactionError(Exception):
+    """Raised when a transaction fails and is rolled back"""
+    pass
+
+def get_db_lock(db_path):
+    """Get or create a lock for a specific database file"""
+    with _locks_lock:
+        if db_path not in _db_locks:
+            _db_locks[db_path] = threading.Lock()
+        return _db_locks[db_path]
+
+
+@contextmanager
+def get_db_connection(db_path, row_factory=True):
+    """
+    Context manager for safe database connections.
+    Creates a new connection per operation and ensures proper cleanup.
+
+    Args:
+        db_path: Path to SQLite database file
+        row_factory: If True, use sqlite3.Row for dict-like access
+
+    Yields:
+        sqlite3.Connection object
+
+    Example:
+        with get_db_connection('trading.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM signals")
+            results = cursor.fetchall()
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=30.0)
+        if row_factory:
+            conn.row_factory = sqlite3.Row
+        # Enable WAL mode for better concurrent access
+        conn.execute("PRAGMA journal_mode=WAL")
+        yield conn
+    finally:
+        if conn:
+            conn.close()
+
+
+@contextmanager
+def transaction(db_path, row_factory=True):
+    """
+    Context manager for database transactions with automatic rollback.
+
+    Provides ACID guarantees - either all operations succeed and are committed,
+    or all operations are rolled back on any error.
+
+    Args:
+        db_path: Path to SQLite database file
+        row_factory: If True, use sqlite3.Row for dict-like access
+
+    Yields:
+        sqlite3.Connection object with active transaction
+
+    Raises:
+        TransactionError: If transaction fails and is rolled back
+
+    Example:
+        try:
+            with transaction('trading.db') as conn:
+                cursor = conn.cursor()
+                # Place order via API
+                order_id = place_order(...)
+                # Only if order succeeds, update database
+                cursor.execute("UPDATE signals SET processed=1, order_id=? WHERE id=?",
+                              (order_id, signal_id))
+                # Commit happens automatically if no exception
+        except TransactionError as e:
+            logging.error(f"Transaction failed: {e}")
+    """
+    lock = get_db_lock(db_path)
+    conn = None
+
+    with lock:
+        try:
+            conn = sqlite3.connect(db_path, timeout=30.0, isolation_level='DEFERRED')
+            if row_factory:
+                conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+
+            # Start explicit transaction
+            conn.execute("BEGIN")
+
+            yield conn
+
+            # If we get here without exception, commit
+            conn.commit()
+            logging.debug(f"[DB] Transaction committed successfully")
+
+        except Exception as e:
+            # Rollback on any error
+            if conn:
+                try:
+                    conn.rollback()
+                    logging.warning(f"[DB] Transaction rolled back due to: {type(e).__name__}: {e}")
+                except Exception as rollback_err:
+                    logging.error(f"[DB] Rollback failed: {rollback_err}")
+
+            raise TransactionError(f"Transaction failed: {e}") from e
+
+        finally:
+            if conn:
+                conn.close()
+
+
+def execute_with_retry(db_path, query, params=None, max_retries=5, retry_delay=0.5):
+    """
+    Execute a write query with retry logic for locked databases.
+
+    Args:
+        db_path: Path to SQLite database file
+        query: SQL query to execute
+        params: Query parameters (tuple or dict)
+        max_retries: Maximum retry attempts
+        retry_delay: Initial delay between retries (doubles each attempt)
+
+    Returns:
+        lastrowid for INSERT, rowcount for UPDATE/DELETE
+
+    Raises:
+        sqlite3.Error: If all retries fail
+    """
+    lock = get_db_lock(db_path)
+    delay = retry_delay
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            with lock:
+                with get_db_connection(db_path) as conn:
+                    cursor = conn.cursor()
+                    if params:
+                        cursor.execute(query, params)
+                    else:
+                        cursor.execute(query)
+                    conn.commit()
+                    return cursor.lastrowid if cursor.lastrowid else cursor.rowcount
+
+        except sqlite3.OperationalError as e:
+            last_error = e
+            if "locked" in str(e).lower() or "busy" in str(e).lower():
+                if attempt < max_retries - 1:
+                    logging.warning(f"[DB RETRY {attempt+1}/{max_retries}] Database locked, waiting {delay:.1f}s...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                continue
+            raise
+        except sqlite3.IntegrityError:
+            # Duplicate entry - not an error, just return None
+            return None
+
+    logging.error(f"[DB ERROR] Failed after {max_retries} attempts: {last_error}")
+    raise last_error
+
+
+def fetch_all(db_path, query, params=None):
+    """
+    Fetch all results from a SELECT query.
+
+    Args:
+        db_path: Path to SQLite database file
+        query: SQL SELECT query
+        params: Query parameters (tuple or dict)
+
+    Returns:
+        List of sqlite3.Row objects
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        return cursor.fetchall()
+
+
+def fetch_one(db_path, query, params=None):
+    """
+    Fetch a single result from a SELECT query.
+
+    Args:
+        db_path: Path to SQLite database file
+        query: SQL SELECT query
+        params: Query parameters (tuple or dict)
+
+    Returns:
+        sqlite3.Row object or None
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        return cursor.fetchone()
+
+
+class ThreadSafeDB:
+    """
+    Thread-safe database wrapper class.
+
+    Provides a cleaner interface for database operations with built-in
+    thread safety and retry logic.
+
+    Example:
+        db = ThreadSafeDB('trading.db')
+        db.init_signals_table()
+        signal_id = db.insert_signal(channel_id, channel_name, ...)
+        pending = db.get_pending_signals()
+    """
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = get_db_lock(db_path)
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize database with WAL mode"""
+        with get_db_connection(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.commit()
+
+    def init_signals_table(self, include_instrument_type=True):
+        """Create signals table if not exists"""
+        if include_instrument_type:
+            query = '''
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT,
+                    channel_name TEXT,
+                    message_id INTEGER,
+                    raw_text TEXT,
+                    parsed_data TEXT,
+                    timestamp TEXT,
+                    processed INTEGER DEFAULT 0,
+                    instrument_type TEXT DEFAULT 'OPTIONS',
+                    UNIQUE(channel_id, message_id)
+                )
+            '''
+        else:
+            query = '''
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT,
+                    channel_name TEXT,
+                    message_id INTEGER,
+                    raw_text TEXT,
+                    parsed_data TEXT,
+                    timestamp TEXT,
+                    processed INTEGER DEFAULT 0,
+                    parser_type TEXT,
+                    signal_type TEXT,
+                    UNIQUE(channel_id, message_id)
+                )
+            '''
+        execute_with_retry(self.db_path, query)
+        logging.info(f"[DB] Signals table ready in {self.db_path}")
+
+    def insert_signal(self, channel_id, channel_name, message_id, raw_text,
+                      parsed_data, timestamp=None, instrument_type='OPTIONS',
+                      parser_type=None, signal_type=None):
+        """
+        Insert a signal with thread-safe retry logic.
+
+        Returns:
+            signal_id on success, None on duplicate
+        """
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
+
+        # Determine which columns to use based on what's provided
+        if instrument_type and not parser_type:
+            query = '''
+                INSERT OR IGNORE INTO signals
+                (channel_id, channel_name, message_id, raw_text, parsed_data, timestamp, processed, instrument_type)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            '''
+            params = (channel_id, channel_name, message_id, raw_text,
+                     json.dumps(parsed_data) if isinstance(parsed_data, dict) else parsed_data,
+                     timestamp, instrument_type)
+        else:
+            query = '''
+                INSERT OR IGNORE INTO signals
+                (channel_id, channel_name, message_id, raw_text, parsed_data, timestamp, processed, parser_type, signal_type)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            '''
+            params = (channel_id, channel_name, message_id, raw_text,
+                     json.dumps(parsed_data) if isinstance(parsed_data, dict) else parsed_data,
+                     timestamp, parser_type, signal_type)
+
+        try:
+            result = execute_with_retry(self.db_path, query, params)
+            return result if result and result > 0 else None
+        except sqlite3.IntegrityError:
+            return None
+
+    def get_pending_signals(self):
+        """Get all unprocessed signals"""
+        return fetch_all(self.db_path,
+                        "SELECT * FROM signals WHERE processed = 0 ORDER BY id ASC")
+
+    def mark_signal_processed(self, signal_id, status=1):
+        """Mark signal as processed (1=success, -1=failed)"""
+        execute_with_retry(self.db_path,
+                          "UPDATE signals SET processed = ? WHERE id = ?",
+                          (status, signal_id))
+
+    def get_signal_by_tradingsymbol(self, tradingsymbol):
+        """Find signal containing tradingsymbol in parsed_data"""
+        return fetch_one(self.db_path,
+                        """SELECT * FROM signals
+                           WHERE parsed_data LIKE ? AND processed = 1
+                           ORDER BY timestamp DESC LIMIT 1""",
+                        (f'%{tradingsymbol}%',))
+
+    def add_order_tracking_columns(self):
+        """Add order_id and order_status columns if they don't exist"""
+        try:
+            with get_db_connection(self.db_path) as conn:
+                cursor = conn.cursor()
+                # Check existing columns
+                cursor.execute("PRAGMA table_info(signals)")
+                columns = [row[1] for row in cursor.fetchall()]
+
+                if 'order_id' not in columns:
+                    cursor.execute("ALTER TABLE signals ADD COLUMN order_id TEXT")
+                    logging.info("[DB] Added order_id column to signals table")
+
+                if 'order_status' not in columns:
+                    cursor.execute("ALTER TABLE signals ADD COLUMN order_status TEXT")
+                    logging.info("[DB] Added order_status column to signals table")
+
+                conn.commit()
+        except sqlite3.OperationalError as e:
+            # Column might already exist
+            logging.debug(f"[DB] Column add skipped: {e}")
+
+    @contextmanager
+    def order_transaction(self, signal_id):
+        """
+        Context manager for processing an order with transaction safety.
+
+        Ensures that:
+        1. Signal is locked for processing
+        2. Order placement and DB update happen atomically
+        3. On failure, signal remains unprocessed for retry
+
+        Args:
+            signal_id: ID of the signal being processed
+
+        Yields:
+            tuple of (connection, cursor, signal_data)
+
+        Example:
+            with db.order_transaction(signal_id) as (conn, cursor, signal):
+                # Place order
+                order_id = kite.place_order(...)
+                # Update in same transaction
+                cursor.execute(
+                    "UPDATE signals SET processed=1, order_id=?, order_status='PLACED' WHERE id=?",
+                    (order_id, signal_id)
+                )
+                # Commit happens automatically
+        """
+        with transaction(self.db_path) as conn:
+            cursor = conn.cursor()
+
+            # Get the signal within the transaction (row locking)
+            cursor.execute(
+                "SELECT * FROM signals WHERE id = ? AND processed = 0",
+                (signal_id,)
+            )
+            signal = cursor.fetchone()
+
+            if not signal:
+                raise TransactionError(f"Signal {signal_id} not found or already processed")
+
+            yield conn, cursor, signal
+
+    def mark_signal_with_order(self, signal_id, order_id, status='PLACED'):
+        """
+        Mark signal as processed with order tracking info.
+
+        Uses a transaction to ensure atomicity.
+
+        Args:
+            signal_id: Signal ID
+            order_id: Broker order ID
+            status: Order status (PLACED, FILLED, REJECTED, etc.)
+        """
+        with transaction(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """UPDATE signals
+                   SET processed = 1, order_id = ?, order_status = ?
+                   WHERE id = ?""",
+                (str(order_id), status, signal_id)
+            )
+            if cursor.rowcount == 0:
+                raise TransactionError(f"Signal {signal_id} not found")
+
+
+# Convenience functions for common databases
+def get_trading_db():
+    """Get thread-safe wrapper for main trading database"""
+    return ThreadSafeDB('trading.db')
+
+def get_jp_signals_db():
+    """Get thread-safe wrapper for JP signals database"""
+    return ThreadSafeDB('jp_signals_trained.db')

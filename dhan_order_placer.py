@@ -1,0 +1,263 @@
+import mysql_sqlite_bridge
+import sqlite3
+import logging
+import time
+import json
+import os
+import sys
+import pytz
+from datetime import datetime, time as dtime
+from core.dhan_client import DhanClient
+from core.strike_lookup import StrikeLookup
+from master_resource import MasterResource
+
+IST           = pytz.timezone("Asia/Kolkata")
+MARKET_OPEN   = dtime(9, 15)
+MARKET_CLOSE  = dtime(15, 25)
+
+def _is_market_open() -> bool:
+    now = datetime.now(IST).time()
+    return MARKET_OPEN <= now <= MARKET_CLOSE
+
+# Setup Logger using Master Hub
+logger = MasterResource.setup_shared_logger("dhan_order_placer")
+
+def get_db_connection():
+    db_path = MasterResource.get_trading_db_path()
+    return sqlite3.connect(db_path, timeout=30)
+
+
+def _ensure_orders_columns():
+    """Add missing columns to orders table if absent."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("PRAGMA table_info(orders)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col, typ in [
+        ("security_id",     "TEXT"),
+        ("exchange_segment","TEXT"),
+        ("strategy_name",   "TEXT"),
+    ]:
+        if col not in existing:
+            cur.execute(f"ALTER TABLE orders ADD COLUMN {col} {typ}")
+            logger.info(f"DB migration: added column orders.{col}")
+    conn.commit()
+    conn.close()
+
+
+def _has_open_position(symbol: str) -> bool:
+    """Return True if there is already an OPEN order for this symbol."""
+    try:
+        conn  = get_db_connection()
+        cur   = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM orders WHERE symbol=? AND status='OPEN'",
+            (symbol,)
+        )
+        count = cur.fetchone()[0]
+        conn.close()
+        return count > 0
+    except Exception:
+        return False
+
+
+class DhanOrderPlacer:
+    def __init__(self, is_sandbox=True):
+        self.client        = DhanClient(is_sandbox=is_sandbox)
+        self.strike_lookup = StrikeLookup()
+        self.is_sandbox    = is_sandbox
+        _ensure_orders_columns()
+        logger.info(f"Dhan Order Placer Initialized (Sandbox={is_sandbox})")
+
+    def poll_signals(self):
+        """Polls the signals table for new signals (processed = 0)."""
+        logger.info("Starting Polling loop for 'signals' table...")
+        while True:
+            try:
+                if not _is_market_open():
+                    logger.debug("Outside market hours — skipping signal execution")
+                    time.sleep(30)
+                    continue
+
+                conn   = get_db_connection()
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    "SELECT * FROM signals WHERE processed = 0 ORDER BY timestamp ASC"
+                )
+                signals = cursor.fetchall()
+
+                for sig in signals:
+                    # sig schema: id, channel_id, channel_name, message_id,
+                    #             raw_text, parsed_data, timestamp, processed, ...
+                    sig_id          = sig[0]
+                    parsed_data_str = sig[5]
+
+                    try:
+                        parsed_data = json.loads(parsed_data_str)
+                    except Exception:
+                        logger.error(
+                            f"Could not parse json from signals.parsed_data: {parsed_data_str}"
+                        )
+                        continue
+
+                    symbol        = parsed_data.get("symbol", "NIFTY")
+                    action        = parsed_data.get("action", "BUY").upper()
+                    price         = float(parsed_data.get("price", 0) or 0)
+                    strategy_name = parsed_data.get("strategy", "Telegram")
+
+                    logger.info(f"Processing Signal ID {sig_id}: {action} {symbol} [{strategy_name}]")
+
+                    # 1. Duplicate position guard
+                    if _has_open_position(symbol):
+                        logger.info(
+                            f"Signal {sig_id} skipped — open position already exists for {symbol}"
+                        )
+                        # Mark processed so we don't keep retrying
+                        cursor.execute(
+                            "UPDATE signals SET processed=-1, order_status='SKIPPED' WHERE id=?",
+                            (sig_id,)
+                        )
+                        conn.commit()
+                        continue
+
+                    # 2. Resolve real security_id via StrikeLookup (options)
+                    #    or fall back to direct equity if symbol not in SYMBOL_CONFIG
+                    option, security_id, exchange_segment, tradingsymbol = \
+                        self._resolve_instrument(symbol, action, price)
+
+                    if security_id is None:
+                        logger.error(
+                            f"Cannot resolve instrument for signal {sig_id} "
+                            f"({symbol} {action}) — skipping"
+                        )
+                        continue
+
+                    # 3. Place order on Dhan
+                    order_id = self.place_dhan_order(
+                        security_id      = security_id,
+                        exchange_segment = exchange_segment,
+                        action           = action,
+                        quantity         = option["lot_size"] if option else 1,
+                    )
+
+                    if order_id:
+                        # 4. Mark signal processed
+                        cursor.execute(
+                            "UPDATE signals SET processed = 1, order_id = ?, "
+                            "order_status = 'PLACED' WHERE id = ?",
+                            (order_id, sig_id),
+                        )
+                        # 5. Insert into orders with full metadata so SL monitor picks it up
+                        cursor.execute(
+                            """INSERT INTO orders
+                                   (signal_id, order_id, symbol, action, quantity,
+                                    entry_price, status, tradingsymbol,
+                                    security_id, exchange_segment,
+                                    strategy_name, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)""",
+                            (
+                                sig_id,
+                                order_id,
+                                symbol,
+                                action,
+                                option["lot_size"] if option else 1,
+                                price,
+                                tradingsymbol or "",
+                                security_id,
+                                exchange_segment,
+                                strategy_name,
+                                datetime.now().isoformat(),
+                            ),
+                        )
+                        conn.commit()
+                        logger.info(
+                            f"Order {order_id} placed and logged "
+                            f"({tradingsymbol or security_id})."
+                        )
+
+                conn.close()
+            except Exception as e:
+                logger.error(f"Error in polling loop: {e}")
+
+            time.sleep(2)
+
+    # ------------------------------------------------------------------
+    # Instrument resolution
+    # ------------------------------------------------------------------
+
+    # Index → option type mapping
+    _INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY"}
+
+    # Fallback equity security IDs for non-index symbols
+    _EQUITY_IDS = {
+        "RELIANCE": ("2885", "NSE_EQ"),
+        "HDFC":     ("1333", "NSE_EQ"),
+    }
+
+    def _resolve_instrument(
+        self,
+        symbol: str,
+        action: str,
+        spot:   float,
+    ):
+        """
+        Returns (option_dict_or_None, security_id, exchange_segment, tradingsymbol).
+        For index symbols the ATM option is looked up via StrikeLookup.
+        For equity symbols the hardcoded equity security_id is used.
+        """
+        if symbol in self._INDEX_SYMBOLS:
+            option_type = "CE" if action == "BUY" else "PE"
+            option = self.strike_lookup.get_atm_option(symbol, spot, option_type)
+            if option:
+                return (
+                    option,
+                    option["security_id"],
+                    option["exchange_segment"],
+                    option["trading_symbol"],
+                )
+            return None, None, None, None
+
+        # Equity fallback
+        if symbol in self._EQUITY_IDS:
+            sid, seg = self._EQUITY_IDS[symbol]
+            return None, sid, seg, symbol
+
+        logger.warning(f"Unknown symbol '{symbol}' — cannot resolve instrument")
+        return None, None, None, None
+
+    # ------------------------------------------------------------------
+    # Order placement
+    # ------------------------------------------------------------------
+
+    def place_dhan_order(
+        self,
+        security_id:      str,
+        exchange_segment: str,
+        action:           str,
+        quantity:         int,
+    ):
+        """Place a MARKET INTRADAY order on Dhan."""
+        try:
+            response = self.client.place_order(
+                security_id      = security_id,
+                exchange_segment = exchange_segment,
+                transaction_type = action,
+                quantity         = quantity,
+                order_type       = self.client.dhan.MARKET,
+                product_type     = self.client.dhan.INTRA,
+                price            = 0,
+            )
+            if response.get("status") == "success":
+                return response.get("data", {}).get("orderId")
+            else:
+                logger.error(f"Dhan Order Failed: {response.get('remarks')}")
+                return None
+        except Exception as e:
+            logger.error(f"Exception placing Dhan order: {e}")
+            return None
+
+
+if __name__ == "__main__":
+    placer = DhanOrderPlacer(is_sandbox=True)
+    placer.poll_signals()

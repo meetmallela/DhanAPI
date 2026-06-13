@@ -1,0 +1,760 @@
+================================================================================
+STRATEGY IMPLEMENTATION TRACKER
+Created : 2026-05-22
+Last Updated : 2026-05-25  (6A Commodity Brain, 6B Price Action Engine, 6C Candlestick Scanner)
+Audit       : 2026-05-24  All 22 tracker items verified against codebase — 100% match.
+                           5 live agents added to Coverage Check (were undocumented).
+                           2 completed MDs moved to Completed_Implementation folder.
+Thread count: 48 threads total after Phase 6 (26 strategy workers + 22 infra daemons)
+================================================================================
+
+LEGEND
+  [ ] = Not Started
+  [~] = In Progress
+  [x] = Completed
+  [SKIP] = Decided to skip / defer
+
+Source MDs: C:\Users\meetm\OneDrive\Desktop\GCPPythonCode\DhanAPI\screenshots\StrategyScreenshots\
+Completed folder: ...\StrategyScreenshots\Completed_Implementation\
+
+--------------------------------------------------------------------------------
+COVERAGE CHECK — Already Implemented (no new work needed)
+--------------------------------------------------------------------------------
+[x] VWAP Reversion (with SD bands)          → VWAP_Reclaim + EMA_VWAP_SR workers
+[x] ORB Opening Range Breakout               → ORB_VWAP worker
+[x] EMA 9/21 Crossover Scalping             → EMA_9_21 worker
+[x] EMA 9/20 Beginner Scalping              → EMA_9_21 worker (same logic)
+[x] VWAP Reclaim / VWAP Rejection           → VWAP_Reclaim worker
+[x] CPR Breakout                             → CPR_Breakout worker
+[x] Price Action Pullback                    → SMC_FVG_BOS + Candle_Reversal workers
+[x] Triple Top / Triple Bottom              → TriplePattern worker
+[x] Double Top / Double Bottom              → Candle_Reversal (partial) + TriplePattern
+[x] Doji, Harami, Shooting Star, Hanging Man → Candle_Reversal (PDF rated below-avg; SKIP new build)
+[x] Wedges                                   → PDF rated below-avg; SKIP
+[x] Cup & Handle                             → Multi-week pattern; SKIP (intraday system)
+[x] Fibonacci Retracement                    → FibRetracement worker
+[x] Donchian Breakout                        → Donchian_Breakout worker
+[x] Ichimoku                                 → Ichimoku worker
+[x] MACD Histogram Divergence               → MACD_Hist_Div worker
+[x] Supertrend + MACD                        → Supertrend_MACD worker
+[x] Index Momentum                           → IndexMomentum worker
+[x] SMC / FVG / BOS                          → SMC_FVG_BOS worker
+[x] GammaBlast (Expiry Day Options Blast)   → GammaBlastWorker (agents/gamma_blast_worker.py)   [Phase 20]
+[x] VIX Straddle (cheap VIX ATM straddle)  → VIXStraddleWorker (agents/vix_straddle_worker.py)   [Phase 22]
+     Entry: VIX 60d pct < 25 AND 120d pct < 25; BUY ATM CE + ATM PE (1 lot each); 09:30–13:30.
+     Backtest: 26 trades, 65% WR, avg ₹6,322/lot, Sharpe 2.51.
+[x] Iron Condor (expensive VIX short vol)  → IronCondorWorker (agents/iron_condor_worker.py)     [Phase 22]
+     Entry: VIX 60d pct > 75 + regime RANGING + Tue/Wed 09:20–10:30; SELL OTM CE/PE ±100 pts,
+     BUY hedge ±200 pts. Shared VIXHistoryStore.
+[x] Weekly Strangle (Thu 15:25 hold 1 wk)  → WeeklyStrangleWorker (agents/weekly_strangle_worker.py) [Phase 23]
+     Entry: Thu 15:25, next-week expiry, OTM ±125 pts, VIX < 20; hold to next Thu;
+     adjust if leg hits 2× entry premium. Backtest 95 cycles: ~62% annualised return, 23.6% DD.
+[x] Red Day CE Seller (red >0.5% + RSI<40)  → RedDaySellerWorker (agents/red_day_seller_worker.py) [Phase 23]
+     Sell NIFTY OTM CE when spot >0.5% below open + RSI(5m)<40 + price<EMA-21.
+     Window: 11:00–13:00. Target 50% profit; SL 2× premium. Once per day.
+[x] Expiry Blast — NiftyBlast1 (15:00 CE)  → ExpiryBlastWorker (agents/expiry_blast_worker.py)   [Built 2026-05-24]
+     Pattern observed 2026-05-18: 52-pt NIFTY spike at 15:00 (OTM CE-writer cover + gamma squeeze).
+     Pre-blast: RSI 35-60, ATR declining, range5 <12 pts, VWAP ±20 pts, EMA converging, BB% 0.20-0.65.
+     Blast: body% >0.85, move >2.5×ATR, RSI jump >15, BB% >1.0. Entry: BUY ATM CE, 1 lot.
+     Active only on NIFTY expiry days (Tuesdays 2026). Hard 15:25 cutoff via SL monitor.
+
+Source MDs moved to Completed_Implementation:
+  - index_trading_strategies.md             [x] MOVED (all strategies already live)
+  - Nifty_Scalping_Strategies_Beginner_Guide.md [x] MOVED (all strategies already live)
+
+================================================================================
+PHASE 1 — Extend Existing Workers  (Target: Week 1, Days 1–2)
+================================================================================
+
+[1A] NR4 Volatility Compression Filter
+      Source   : strategy_analysis.md → PDF 2 (Medium Priority)
+      What     : 4-candle range check; if candle N has the narrowest H-L of last 4
+                 candles AND is within 5 pts of VWAP → flag as NR4 coil before signal
+      Where    : strategies/indicators.py  → is_nr4()
+                 strategies/vwap_reclaim.py → NR4 gate on RECLAIM/REJECTION signals
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: indicators.py:is_nr4() added; vwap_reclaim.py gates RECLAIM/
+                 REJECTION signals — fires only when current OR prior candle is NR4.
+                 Band Extreme signals bypass the gate (mean-reversion, not coil).
+
+[1B] Inside Bar Breakout Gate
+      Source   : strategy_analysis.md → PDF 2 (Medium Priority)
+      What     : Last completed candle high < prev high AND low > prev low → pending
+                 Fire only when next candle breaks inside bar range in signal direction
+      Where    : strategies/indicators.py  → is_inside_bar()
+                 strategies/vwap_reclaim.py → gate on RECLAIM/REJECTION
+                 strategies/advanced_ema_orb.py → gate on check_orb_vwap()
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: indicators.py:is_inside_bar() added; vwap_reclaim.py gates reclaim/
+                 rejection signals when prior candle was inside bar; advanced_ema_orb.py
+                 gates ORB breakout when prior candle was inside bar.
+
+[1C] Engulfing at S/R Proximity Validation
+      Source   : strategy_analysis.md → PDF 2 (Medium Priority)
+      What     : Confirm bullish_engulfing() / bearish_engulfing() in candlestick.py
+                 require proximity to VWAP or ORB level (within 0.3%)
+      Where    : strategies/candlestick.py  → has_bullish/bearish_pattern() updated
+                 strategies/multi_strike_scalp.py → passes vwap_v as ref_price
+                 strategies/candlestick_reversal.py → already had 0.25% VWAP/EMA gate ✓
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: has_bullish_pattern(ref_price, tolerance=0.003) and has_bearish_pattern()
+                 both accept optional ref_price; backward-compatible (default=0 skips check).
+                 multi_strike_scalp.py now passes vwap_v so Gate 4 candlestick is VWAP-anchored.
+                 candlestick_reversal.py confirmed: already checks 0.25% VWAP/EMA-21 proximity.
+
+[1D] Bull Spread Mode (Debit Spread on execute())
+      Source   : strategy_analysis.md → PDF 1 (HIGH IMPACT)
+      What     : Buy ATM CE/PE + simultaneously sell OTM CE/PE (1–2 strikes away)
+                 Caps max loss by ~35–45%; caps gain at strike diff minus net debit
+                 Gate: only when ADX > 25 at signal time
+      Where    : core/order_placer.py + DhanOmniEngine.py execute() method
+      Effort   : 1 day
+      Notes    : Confirm Dhan API allows sell-open on FNO in same session;
+                 may require 2 sequential orders if no atomic support
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: core/order_placer.py: place_debit_spread(long_id, short_id, segment,
+                 qty, long_ltp, short_ltp) → places BUY then SELL sequentially; aborts
+                 short leg if long leg fails (no naked short risk).
+                 DhanOmniEngine.py: _SPREAD_ADX_MIN=25.0 constant; execute() computes
+                 adx_val=_regime_adx(df_5m) after spot fetch; if adx_val>=25 routes to
+                 _execute_debit_spread() else existing single-leg path unchanged.
+                 _execute_debit_spread(): resolves OTM leg via get_atm_neighbors()
+                 (CE→ATM+1 offset, PE→ATM-1 offset); fetches LTPs for both legs; places
+                 spread via place_debit_spread(); paper-fallbacks each leg independently;
+                 logs both legs to orders table with spread_mode:True + net_debit in
+                 strategy_context; falls back to single-leg BUY if OTM not in scrip master.
+
+================================================================================
+PHASE 2 — New Strategy Workers  (Target: Week 1, Days 3–5 + Week 2, Days 1–2)
+================================================================================
+
+[2A] FlagBreakout Worker
+      Source   : strategy_analysis.md → PDF 2 (HIGH PRIORITY)
+      What     : Flagpole = 3–8 consecutive 5m candles each moving > 0.3% same direction
+                 Flag body = 5–15 candles, avg H-L range < 50% of pole avg range, counter-slope
+                 (10% pole-height tolerance accepts pennants); Entry: close breaks flag
+                 channel + volume > 1.2x flag average; Target: pole height from breakout;
+                 SL: far edge of flag; Time gate: 9:30–14:00 IST; Cooldown: 30 min
+      Where    : strategies/flag_breakout.py        → FlagBreakoutStrategy (new)
+                 agents/flag_breakout_worker.py      → FlagBreakoutWorker   (new, worker Z)
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: detect_payload() is primary interface returning {direction, pattern,
+                 entry, sl, target, pole_height, flag_high, flag_low, pole_candles,
+                 flag_candles, confidence}; check_signal() is a thin string wrapper.
+                 8-test suite passed: BULLISH/BEARISH detection, no-breakout, wrong
+                 slope, cooldown dedup, check_signal wrapper, time gate, volume gate.
+                 Register in DhanOmniEngine_v2.py:
+                   from agents.flag_breakout_worker import FlagBreakoutWorker
+                   self._workers.append(FlagBreakoutWorker(self._signal_queue))
+
+[2B] TriangleBreakout Worker
+      Source   : strategy_analysis.md → PDF 2 (HIGH PRIORITY)
+      What     : Ascending  → rolling 10-candle max flat (±0.1%) + rising lows → break up → CE
+                 Descending → rolling 10-candle min flat (±0.1%) + falling highs → break down → PE
+                 Symmetrical → converging both; RSI > 55 → CE, RSI < 45 → PE
+                 ADX > 20 gate on breakout candle
+      Where    : strategies/triangle_breakout.py     → TriangleBreakoutStrategy (new)
+                 agents/triangle_breakout_worker.py  → TriangleBreakoutWorker  (new, worker AA)
+      Effort   : 1 day
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: detect_payload() primary interface returns {direction, pattern, entry, sl,
+                 target, resistance, support, triangle_height, confidence}.
+                 Three patterns: ASCENDING_TRIANGLE (flat highs ±0.1% + OLS rising lows +
+                 breakout above), DESCENDING_TRIANGLE (flat lows ±0.1% + OLS falling highs +
+                 breakout below), SYMMETRICAL_TRIANGLE (converging highs+lows, RSI>55→BULLISH
+                 or RSI<45→BEARISH). ADX(14)>20 + volume>1.2× triangle avg gates on all.
+                 MIN_CANDLES=35 (ADX warmup + 10-candle window). Cooldown 30 min per index.
+                 Register in DhanOmniEngine_v2.py:
+                   from agents.triangle_breakout_worker import TriangleBreakoutWorker
+                   self._workers.append(TriangleBreakoutWorker(self._signal_queue))
+
+[2C] HS_Pattern Worker (Head & Shoulders)
+      Source   : strategy_analysis.md → PDF 2 (HIGH PRIORITY)
+      What     : Use find_peaks() / find_troughs() from strategies/indicators.py
+                 H&S Top  : 3 peaks, centre highest, neckline break down → PE
+                 Inv H&S  : 3 troughs, centre lowest, neckline break up → CE
+                 Volume gate: breakout candle > 1.2x 10-candle average
+                 Target  : head-to-neckline distance projected from neckline
+                 SL      : right shoulder high (H&S Top) / low (Inv H&S)
+      Where    : strategies/hs_pattern.py       → HSPatternStrategy (new)
+                 agents/hs_pattern_worker.py    → HSPatternWorker   (new, worker AB)
+      Effort   : 2 days
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: detect_payload() primary interface returns {direction, pattern, entry,
+                 sl, target, head, ls, rs, neckline, pattern_bars, confidence}.
+                 Neckline = avg of two inter-peak trough lows (H&S Top) or inter-trough
+                 peak highs (Inv H&S). Shoulder symmetry gate: |LS-RS|/head_height < 60%.
+                 Volume gate: breakout candle > 1.2x 10-bar pre-breakout average.
+                 Confidence: 0.50 base + tight symmetry +0.20 + strong volume +0.20 +
+                 substantial pattern (>15 bars) +0.10. Scans most-recent triplet first.
+                 Tests passed: H&S Top detection, Inv H&S detection, no-breakout,
+                 short-data NEUTRAL, low-volume gate, symmetry gate math verified.
+                 Register in DhanOmniEngine_v2.py:
+                   from agents.hs_pattern_worker import HSPatternWorker
+                   self._workers.append(HSPatternWorker(self._signal_queue))
+
+[2D] Enhanced Candlestick Pattern Agent (1M Multi-Index)
+      Source   : Candlestick Pattern Detection Agent (1M Multi-Index).md
+      What     : Added 4 new 3-candle patterns + confidence scoring + structured JSON payload
+      Where    : strategies/candlestick.py        → 4 new functions + updated aggregates
+                 strategies/candlestick_reversal.py → check_signal() + detect_signal_payload()
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: candlestick.py: is_morning_star(), is_evening_star(), is_three_inside_up(),
+                 is_three_inside_down() added; has_bullish/bearish_pattern() updated to include them.
+                 candlestick_reversal.py: check_signal() now checks all 6 patterns (2+4);
+                 new detect_signal_payload() returns {timestamp, index, pattern, direction,
+                 confidence, entry, sl, target}; _confidence() scores 0.0-1.0 using key-level
+                 proximity (+0.15), volume spike (+0.20), 3-candle bonus (+0.10).
+      MD File  : MOVED to Completed_Implementation (all items from this MD done).
+
+================================================================================
+PHASE 3 — New Infrastructure / Data Sources  (Target: Week 2, Days 3–5)
+================================================================================
+
+[3A] PCR / Max Pain Daily Context Filter
+      Source   : strategy_analysis.md → PDF 1 (MEDIUM IMPACT)
+      What     : Fetch NSE OI endpoint at 9:20 IST for current expiry
+                 PCR = total PE OI / total CE OI
+                   > 1.2 → bias CE signals for the day
+                   < 0.7 → bias PE signals
+                   0.7–1.2 → no bias
+                 Max Pain = strike minimising total ITM OI value
+                   Avoid CE entries when spot >> max pain (last 2 hrs expiry day)
+                   Avoid PE entries when spot << max pain
+                 Pass day_bias into Director Agent
+      Where    : agents/pcr_filter.py  (new file); feed into DhanOmniEngine Director
+      Effort   : 1 day
+      Notes    : NSE public OI API — no auth needed
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: agents/pcr_filter.py: PCRFilter daemon thread; fetches NSE option-chain
+                 API at 09:20 IST + every 30 min; _compute_max_pain() uses O(n²) ITM-value
+                 minimisation; thread-safe properties: pcr, pcr_bias, max_pain, is_ready;
+                 is_max_pain_blocked(spot, option_type) → True only on expiry day after
+                 13:30 IST when spot deviates > 100 pts from max pain; module-level
+                 singleton via init_instance() / get_instance().
+                 agents/data_agent.py: pcr_filter=None param; PCR bias merged into
+                 day_bias: NEUTRAL dir → adopt PCR; same → confirmed; conflict → NEUTRAL.
+                 DhanOmniEngine_v2.py: PCRFilter instantiated (step 5b), registered as
+                 singleton, added to all_threads, passed to DataAgent.
+                 DhanOmniEngine.py execute(): max-pain gate checks get_instance() before
+                 spread routing; blocks on expiry day last 2 hrs when spot far from max_pain.
+                 Tests: singleton, initial state, max_pain arithmetic, bias classification,
+                 expiry-day guard, time guard, all 5 merge-rule cases.
+
+[3B] MCX Commodity Execution + Brain
+      Source   : Commodity Trading Brain Design.md
+      What     : Wire MCX execution in dhan_tg_trader.py (currently parsed but dropped)
+                 New agents/mcx_worker.py:
+                   - Security_id lookup for MCX futures from Dhan master
+                   - DXY correlation: poll Yahoo Finance / Stooq
+                   - EIA data: Wed 10:30 PM IST release → suppress signals ±30 min
+                   - Session overlap flag: CME opens 9 PM IST → higher volatility mode
+      Where    : dhan_tg_trader.py (remove MCX return) + agents/mcx_worker.py (new)
+      Effort   : 2 days
+      Notes    : Dhan MCX security_id mapping is the key blocker — verify first
+                 RESOLVED: MCX FUTCOM in segment='M', SEM_EXM_EXCH_ID='MCX';
+                 exchange_segment='MCX_COMM'; confirmed via dhanhq.py constants.
+      MD File  : Commodity Trading Brain Design.md
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: core/mcx_lookup.py: MCXLookup class — reads scrip master segment M,
+                 filters FUTCOM MCX rows; get_front_month(symbol) returns nearest
+                 unexpired contract {security_id, trading_symbol, expiry_date, lot_size,
+                 exchange_segment="MCX_COMM"}; 8h cache; module-level singleton
+                 get_mcx_lookup().
+                 agents/mcx_worker.py: MCXWorker daemon thread; polls DXY from Stooq
+                 every 5 min (https://stooq.com/q/l/?s=dx-y.nybot); EIA blackout ±30 min
+                 (CRUDEOIL/CRUDEOILM: Wed 22:00 IST, NATURALGAS/NATGASMINI: Thu 20:00
+                 IST); is_safe_to_trade(symbol) → (bool, reason); is_cme_session() True
+                 during 21:00-23:59 IST (higher volatility flag, not a hard block);
+                 init_instance() / get_instance() singleton pattern.
+                 dhan_tg_trader.py: MCX elif branch now executes — mcx_lookup.get_front_month()
+                 resolves security_id; MCXWorker guards EIA blackout; CME session logged
+                 as warning; falls through to shared place_market_order + DB insert.
+                 MCXWorker started at module init alongside existing Dhan components.
+
+[3C] Nifty Futures Basis / OI / Constituent Lead-Lag Engine
+      Source   : System Architecture & Design Prompt.md
+      What     : Track live basis = NF futures LTP − Nifty spot (Kite streaming)
+                 OI build: Dhan get_market_quote() for NF futures; track OI Δ per 5 min
+                 Constituent lead-lag: Kite LTP for top-10 Nifty stocks
+                   If 3+ heavyweights (HDFC/Reliance/ICICI) move > 0.3% before index
+                   → early directional signal into OmniEngine queue
+      Where    : agents/futures_basis_worker.py  (new file)
+      Effort   : 2 days
+      MD File  : System Architecture & Design Prompt.md
+      Status   : [x] COMPLETED 2026-05-22
+      Completed: agents/futures_basis_worker.py: FuturesBasisWorker daemon thread;
+                 loads NIFTY front-month FUTIDX from scrip master (segment D, NSE);
+                 polls NF LTP + OI via get_market_quote(NSE_FNO) every 60s;
+                 tracks 5-cycle OI delta rolling window; logs basis = NF_LTP - NIFTY_spot;
+                 constituent lead-lag: fetches BSE LTPs for top-10 Nifty heavyweights
+                 (HDFCBANK/RELIANCE/ICICIBANK/INFY/TCS/BHARTIARTL/AXISBANK/KOTAKBANK/SBIN/LT)
+                 via single get_market_quote(BSE) call; emits BULLISH/BEARISH SignalEvent
+                 when ≥3 heavyweights moved >0.3% while index moved <0.15% (lead-lag gap);
+                 15-min cooldown per direction. Wired into DhanOmniEngine_v2.py step 9g.
+                 Tests passed: NF contract lookup, BULLISH lead-lag emit, no-signal when
+                 index caught up, cooldown suppression.
+
+================================================================================
+PHASE 4 — New Paradigm (Separate Systems, Post-Live Account)
+================================================================================
+
+[4A] Swing Trading Orchestration Agent
+      Source   : Swing Trading Orchestration Agent.md
+      What     : Multi-week swing trader (2–3 weeks hold), entirely separate from
+                 intraday system
+                 New DB tables: swing_watchlist, swing_positions
+                 State machine: WATCHLIST → ACTIVE → CLOSED_PROFIT/CLOSED_LOSS/TIMEOUT
+                 Post-market scan at 16:00 IST (Kite EOD data)
+                 Intraday trigger check at 9:30 IST vs. watchlist
+                 Max 21-day hold; trailing SL; daily close vs. entry tracking
+      Where    : agents/swing_agent.py  (new file) + new DB tables
+      Effort   : 3–4 days
+      Blocker  : Dhan sandbox does NOT support overnight positions
+                 Build only after live account is activated
+      MD File  : Swing Trading Orchestration Agent.md
+      Status   : [x] COMPLETED 2026-05-24 — re-architected as Kite-powered paper trader
+      Completed: config/swing_universe.json (~254 NSE symbols, configurable).
+                 core/swing_eod_store.py: EOD fetch via Kite daily candles → swing_eod.db;
+                 365-day seed; INSERT OR IGNORE; fetch_latest_eod() for incremental updates.
+                 strategies/swing_scanner.py: EMA_PULLBACK / NR4_COIL / HIGH_BREAKOUT setups;
+                 confidence scoring; ScanResult dataclass.
+                 agents/swing_agent.py: daemon thread; 15:35 EOD fetch, 16:00 scan,
+                 09:30 entry check, 16:15 position update; Saturday weekend scan.
+                 swing_setup.py: one-time token resolution + EOD seed (250/254 symbols, 61,303 rows).
+                 Dashboard: /api/swing endpoint + Swing tab in dashboard.html.
+                 start_trading_system.py: Swing Agent added to PROCESSES.
+
+[4B] Fundamental Analysis & Paper Portfolio Agent
+      Source   : Fundamental Analysis & Paper Portfolio Agent.md
+      What     : Equity FA scoring engine (ROE, ROCE, D/E, FCF, P/E, P/B, EV/EBITDA)
+                 Paper portfolio with 60-day forward tracking
+                 Weekend update loop: absolute return + alpha vs. Nifty + max drawdown
+                 Self-correction: compare underperformers vs. original scores → reweight
+      Where    : agents/fundamental_agent.py  (new file) + DB table fa_portfolio
+      Effort   : 4–5 days
+      Notes    : Separate data sources (Screener.in / Tijori / NSE annual reports)
+                 NOT connected to live trading engine — research tool only
+      MD File  : Fundamental Analysis & Paper Portfolio Agent.md
+      Status   : [x] COMPLETED 2026-05-24
+      Completed: core/fa_scorer.py: FAScore dataclass + FAScorer class (7 metrics: ROE,
+                 ROCE, D/E, FCF, P/E, P/B, EV/EBITDA); sub-scores 0-100 with thresholds;
+                 composite weighted score; DEFAULT_WEIGHTS summing to 1.0; weight
+                 persistence to fa_score_weights via save_weights()/get_weights();
+                 ROCE computed from ebit/(totalAssets-totalCurrentLiabilities); fallback
+                 to returnOnAssets×1.4; _generate_thesis() → BUY/WATCH/PASS verdict.
+                 agents/fundamental_agent.py: ensure_fa_tables() (4 tables: fa_portfolio,
+                 fa_performance, fa_score_weights, fa_score_snapshot); FAAgent daemon
+                 thread (Sat 10:00 full scan, weekday 16:30 price update); _run_scan()
+                 batch-scores universe + saves snapshots + adds top-15 picks; _update_portfolio()
+                 fetches current prices + computes abs_return/alpha vs NIFTY/drawdown + auto-closes
+                 after 90 days; _run_self_correction() Pearson correlation → new weights.
+                 fa_setup.py: one-time setup (tables + seed weights + optional initial scan).
+                 dhan_dashboard.py: /api/fa endpoint (active, snapshots, closed, stats).
+                 DhanOmniEngine_v2.py: FAAgent added as thread 9i in all_threads; banner updated.
+
+================================================================================
+PHASE 5 — New MD: Real-Time Price/Volume Anomaly Scanner & Portfolio Risk Engine
+================================================================================
+
+[5A] Anomaly Scanner — Engine A (FnO Price/Volume Breakout Detection)
+      Source   : Real-Time PriceVolume Anomaly Scanner & Portfolio Risk Engine.md
+      What     : Batch-scan ~209 FnO-eligible NSE stocks every 5 min during market hours.
+                 Alert types: PRICE_UP/DOWN (>2% from prev_close), VOL_SPIKE (>2× time-scaled
+                 expected volume), COMBINED (both triggered).
+                 Pre-built baselines: 20-day avg vol, ATR14, 52-week H/L, prev_close.
+                 Nightly 18:00: refresh baselines from yfinance.
+      Status   : [x] COMPLETED 2026-05-25
+      Completed: core/fno_universe.py: FnoUniverse class — derives 209 FnO underlyings from
+                 Dhan scrip master OPTSTK rows (handles BAJAJ-AUTO hyphen correctly);
+                 maps 207/209 to NSE_EQ security_ids for batch Dhan quotes;
+                 get_fno_symbols() / get_eq_security_ids() / is_fno() / get_non_fno_positions();
+                 module-level singleton get_fno_universe().
+                 core/baseline_store.py: BaselineStore class — yfinance .history(1y) per symbol;
+                 stores prev_close, vol20, atr14, high52w, low52w in anomaly_baselines SQLite table;
+                 get(symbol) / get_stale_symbols() / refresh(symbols, rate_limit);
+                 module-level singleton get_baseline_store().
+                 CLI: python core/baseline_store.py [--dry-run].
+                 agents/anomaly_scanner.py: AnomalyScanner daemon (step 9j); batch Dhan
+                 quote_data(NSE_EQ, 50/call) during market hours; yfinance per-symbol fallback;
+                 time-scaled volume: expected_vol = vol20 × elapsed_session_pct;
+                 writes hits to anomaly_alerts table; nightly 18:00 baseline refresh.
+                 dhan_dashboard.py: /api/anomalies (alerts + stats, hours filter) endpoint.
+                 templates/dashboard.html: Anomalies tab with stats bar, risk-flags inline panel,
+                 alert table (type colour-coded), 1h/4h/8h/24h filter; auto-refresh every 10s.
+                 DhanOmniEngine_v2.py: AnomalyScanner wired as thread 9j.
+
+[5B] Risk Sentinel — Engine B (Non-FnO Position Monitor)
+      Source   : Real-Time PriceVolume Anomaly Scanner & Portfolio Risk Engine.md
+      What     : Polls Dhan open positions every 5 min. Flags NSE_EQ (equity) positions
+                 whose symbol is NOT in the FnO universe — these lack options hedging.
+                 Auto-clears a flag when the position is closed.
+      Status   : [x] COMPLETED 2026-05-25
+      Completed: agents/risk_sentinel.py: RiskSentinel daemon (step 9k); get_positions()
+                 every 5 min during market hours; FnoUniverse.get_non_fno_positions() filter;
+                 ACTIVE flag on first detection; CLEARED auto-set when position disappears;
+                 risk_flags table (symbol, qty, product, avg_price, flagged_at, status).
+                 dhan_dashboard.py: /api/risk_flags (active + cleared last 7 days) endpoint.
+                 templates/dashboard.html: risk-flag inline panel on Anomalies tab
+                 (red border alert box; shows when active non-FnO flags exist).
+                 DhanOmniEngine_v2.py: RiskSentinel wired as thread 9k.
+
+================================================================================
+PHASE 6 — Equity Intelligence Expansion (New 2026-05-25)
+================================================================================
+
+[6C] Candlestick Pattern Scanner — Multi-TF, 209 FnO Stocks
+      Source   : NEXT_PHASE_RESEARCH_25MAY2026.md → Topic 3
+      What     : Real-time detection of 31 candlestick patterns across 4 timeframes
+                 (1M / 5M / 1H / 4H) for all 209 NSE FnO equity stocks.
+                 Quality gates: body ≥ 0.3%, volume > 1.3× avg20, EMA21 alignment.
+                 Confidence scoring 1–3; UNIQUE dedup on (symbol, timeframe, pattern, candle_time).
+                 Data pipeline: Dhan intraday_minute_data() → equity_candles.db (1M);
+                 resample to 5M in-memory; yfinance for 1H/4H.
+      Status   : [x] COMPLETED 2026-05-25
+      Completed:
+        core/equity_candle_store.py
+          - DB: equity_candles.db → equity_candles_1min table
+          - fetch_today(symbol, security_id, dhan_client) → Dhan NSE_EQ, interval=1
+          - save_candles / load_candles(symbol, days) / resample(df1m, minutes)
+          - _parse_dhan_response(): handles start_Time unix epoch, IST conversion
+          - db_stats() for monitoring
+
+        agents/equity_candle_collector.py
+          - EquityCandleCollector daemon thread (thread 9l in DhanOmniEngine_v2.py)
+          - Cycles 209 FnO stocks at 0.4 s/symbol → full sweep ≈ 84 s
+          - Startup sweep on first market-hours entry; final sweep at 15:35
+          - Market hours: Mon-Fri 09:15–15:35 IST
+
+        core/candle_patterns.py
+          - 31 pure-pandas pattern detection functions (no TA-Lib dependency)
+          - Imports 8 from strategies/candlestick.py (hammer, shooting_star,
+            bullish/bearish_engulfing, morning/evening_star, three_inside_up/down)
+          - New single-candle (7): doji, dragonfly_doji, gravestone_doji,
+            bullish/bearish_marubozu, inverted_hammer, hanging_man
+          - New two-candle (7): bullish/bearish_harami, tweezer_bottom/top,
+            piercing_line, dark_cloud_cover, bullish/bearish_kicker
+          - New three-candle (9): morning/evening_doji_star, three_outside_up/down,
+            three_white_soldiers, three_black_crows, bullish/bearish_three_line_strike
+          - PATTERN_REGISTRY = [(fn, name, direction, min_bars)] — 31 entries
+          - Constants: _DOJI_FRAC=0.10, _SMALL_FRAC=0.30, _LARGE_FRAC=0.60, _WICK_RATIO=2.0
+
+        agents/pattern_scanner.py
+          - PatternScanner daemon thread (thread 9m in DhanOmniEngine_v2.py)
+          - ensure_pattern_table(): pattern_alerts table in trading.db with
+            UNIQUE(symbol, timeframe, pattern, candle_time)
+          - _scan_timeframe(): runs all 31 patterns on last bar, applies gates,
+            confidence = base + vol_ratio≥1.3 (+1) + EMA21 aligned (+1)
+          - Schedule: every 5 min → 1M + 5M; every 60 min → 1H; every 4H → 4H
+          - yfinance 1H cache TTL=3600s; 4H = 1H resampled to 240-min bars
+
+        dhan_dashboard.py: /api/patterns endpoint (hours/tf/dir/limit filters)
+        templates/dashboard.html: 🕯 Patterns tab (stats bar, confidence stars,
+          TF/direction/hours selectors, table: symbol/TF/pattern/dir/conf/entry/stop/target/R:R)
+        DhanOmniEngine_v2.py: threads 9l (EquityCandleCollector) + 9m (PatternScanner) wired
+
+[6B] Price Action Trade Engine — Structure, Zones, and Setups
+      Source   : NEXT_PHASE_RESEARCH_25MAY2026.md → Topic 2
+      What     : Full SMC/ICT Price Action stack on 209 FnO stocks.
+                 1H structure analysis: swing points, market structure classification,
+                 BOS (Break of Structure) and ChoCH (Change of Character) detection.
+                 Order Block and Fair Value Gap identification and zone persistence.
+                 5M entry confirmation: pin bar, engulfing, inside-bar breakout at zone.
+                 Setup scoring 1–3 (zone touch → structure aligned → candle confirmation).
+      Status   : [x] COMPLETED 2026-05-25
+      Completed:
+        core/pa_engine.py
+          - SwingPoint = namedtuple(idx, price, swing_type, time)
+          - get_swings(df, window=3) → list[SwingPoint] using find_peaks/find_troughs
+          - classify_structure(swings, lookback=6) → UPTREND | DOWNTREND | RANGING
+          - get_structural_levels(swings) → {last_swing_high, prev_swing_high, ...}
+          - detect_bos(df, swings, structure) → dict|None (broken_level, direction)
+          - detect_choch(df, swings, structure) → dict|None (first reversal warning)
+          - detect_order_blocks(df, lookback=40, min_impulse_pct=0.8) → list[dict]
+            Last bearish bar before ≥0.8% rally → OB_BULL; last bullish before drop → OB_BEAR
+          - detect_fvg(df, lookback=30, min_gap_pct=0.1) → list[dict]
+            C1.high < C3.low → FVG_BULL; C1.low > C3.high → FVG_BEAR
+          - is_at_zone(price, zone_high, zone_low, tolerance=0.005) → bool
+          - detect_pin_bar, detect_engulfing, detect_ib_breakout → (bool, dir|None)
+          - get_pa_context(df) → one-shot full context dict
+          - Imports find_peaks/find_troughs/is_inside_bar/is_nr4 from strategies/indicators.py
+
+        agents/pa_scanner.py
+          - PAScanner daemon thread (thread 9n in DhanOmniEngine_v2.py)
+          - ensure_pa_tables(): pa_zones + pa_setups tables in trading.db
+            pa_zones: UNIQUE(symbol, timeframe, zone_type, zone_high, zone_low)
+            pa_setups: UNIQUE(symbol, setup_type, direction, zone_type, detected_at)
+          - _load_1h(symbol): yfinance 60d 1H with 3600s TTL cache
+          - _load_5m(symbol): equity_candles.db resample first, yfinance 15d 5m fallback
+          - _upsert_zones(): INSERT OR IGNORE OB/FVG zones with FRESH status
+          - _scan_symbol(): 1H structure → BOS/ChoCH events → zone-touch check
+            → 5M entry confirmation → _calc_setup() for entry/stop/target/R:R
+          - SCAN_INTERVAL=300s; ZONE_TOUCH_TOL=0.005 (0.5%)
+          - Fixed SQL bug: WHERE zone_low=? (was zone_low? — typo)
+
+        dhan_dashboard.py: /api/pa_setups endpoint (hours/dir/conf/status/limit)
+          Returns setups list + active zones list + stats
+        templates/dashboard.html: 🔍 PA Setups tab (stats bar, setup table with
+          direction/struct/conf/entry/stop/T1/T2/R:R/zone/type/status, collapsible
+          active zones panel with high/low/impulse%/status/tested_count)
+        DhanOmniEngine_v2.py: thread 9n (PAScanner) wired; pa_scanner_inst in all_threads
+
+[6A] Commodity Brain — MCX Mini Contracts Signal Engine
+      Source   : NEXT_PHASE_RESEARCH_25MAY2026.md → Topic 1
+      What     : 5-signal composite scoring engine for 5 MCX mini contracts.
+                 Instruments: GOLDM, SILVERM, CRUDEOILM, NATURALGAS, COPPERM.
+                 Signals: EMA9/21 cross, SuperTrend(7,3), VWAP deviation,
+                 ORB breakout (first 15-min range), DXY direction (rising DXY → bearish metals).
+                 Composite score −5 to +5; fires BULLISH at ≥ 3, BEARISH at ≤ −3.
+                 Guards: EIA blackout (via MCXWorker), overnight cutoff at 22:30 IST.
+                 MCX market hours: 09:00–23:30 IST (Mon-Fri).
+                 Data: Dhan MCX_COMM primary; yfinance (GC=F/SI=F/CL=F/NG=F/HG=F) fallback.
+      Status   : [x] COMPLETED 2026-05-25
+      Completed:
+        core/mcx_candle_store.py  (new)
+          - DB: mcx_candles.db → mcx_candles_1min(symbol, security_id, expiry_date, dt, OHLCV)
+          - fetch_today(symbol, security_id, expiry_date, dhan_client)
+            exchange_segment="MCX_COMM", instrument_type="FUTCOM", interval=1
+          - save_candles / load_candles(symbol, days) / resample(df1m, minutes)
+          - Reuses _parse_dhan_response() pattern identical to equity_candle_store.py
+
+        agents/mcx_candle_collector.py  (new)
+          - MCXCandleCollector daemon thread (part of thread 9o)
+          - Resolves front-month contracts via MCXLookup.get_front_month() daily
+          - Cycles 5 instruments at 0.5 s each (~2.5 s full cycle)
+          - MCX hours: Mon-Fri 09:00–23:30 IST
+          - Auto-adapts on monthly contract rollover (re-checks each day)
+
+        agents/commodity_brain.py  (new)
+          - CommodityBrain daemon thread (part of thread 9o)
+          - ensure_commodity_tables(): commodity_signals table in trading.db
+            Stores: symbol, category, direction, score, entry/stop/target1/target2,
+            ema_signal, st_signal, vwap_signal, orb_signal, dxy_signal, atr14,
+            vwap_price, orb_high, orb_low, eia_blocked, data_source, detected_at
+          - _load_mcx_5m(symbol): mcx_candle_store primary, yfinance proxy fallback
+          - _compute_signals(): 5 signals via backtest/indicators.py ema/atr/supertrend/vwap
+            ORB: first 3 × 5M bars of session (≈15 min); DXY: rolling 6-reading deque
+          - _calc_levels(direction, entry, atr14): 1.5×ATR stop, 2:1/3:1 R:R targets
+          - SCAN_INTERVAL=300s; NO_NEW_ENTRY=(22,30)
+          - Smoke test output: all 5 instruments scored live via yfinance
+
+        MCXWorker (re-exported from agents/mcx_worker.py via commodity_brain.py):
+          - init_instance() registered in DhanOmniEngine_v2.py so CommodityBrain
+            can call get_instance() for EIA blackout checks
+
+        dhan_dashboard.py: /api/commodities endpoint (hours/dir/status/limit)
+          Returns signals + snapshot (latest price per symbol) + stats
+        templates/dashboard.html: 🥇 Commodities tab (stats bar, 5 live snapshot
+          cards with price/direction/score, signal table with per-signal arrow cells,
+          EIA warning column, data source column, MCX session info footer)
+        DhanOmniEngine_v2.py: thread 9o: mcx_guard (MCXWorker) + mcx_coll
+          (MCXCandleCollector) + commodity_brain (CommodityBrain) — 3 daemons
+
+================================================================================
+DEFERRED — Call / Put Ratio Back Spread
+================================================================================
+
+[x] Call Ratio Back Spread (CRBS)
+      Source   : strategy_analysis.md → PDF 1 (HIGH IMPACT, HIGH COMPLEXITY)
+      What     : Sell 1 ATM+1 CE + Buy 2 ATM+2 CE
+                 Profits on large upside move; bounded loss if flat
+                 Gate: ADX >= 30 (fires automatically from execute() routing)
+      Status   : [x] COMPLETED 2026-05-24
+      Completed: core/strike_lookup.py: get_atm_option_offset(symbol, spot, option_type,
+                 offset, expiry_date) — resolves any ATM±N strike, used for both legs.
+                 core/order_placer.py: place_ratio_back_spread() — BUY 2x long leg first
+                 (safe order; if BUY fails SELL is skipped, no naked short risk), then
+                 SELL 1x short leg; returns (buy_id, sell_id).
+                 DhanOmniEngine.py: _RBS_ADX_MIN=30.0; execute() now 3-tier:
+                 ADX<25=single-leg, 25-29=debit spread, >=30=RBS.
+                 _execute_ratio_back_spread(): resolves ATM+1 (short) and ATM+2 (long)
+                 via get_atm_option_offset; places via place_ratio_back_spread(); logs
+                 both legs with spread_type="RBS" + net_cost in strategy_context;
+                 falls back to debit spread if ATM+2 not in scrip master.
+
+[x] Put Ratio Back Spread (PRBS)
+      Source   : strategy_analysis.md → PDF 1 (HIGH IMPACT, HIGH COMPLEXITY)
+      What     : Sell 1 ATM-1 PE + Buy 2 ATM-2 PE
+                 Mirror of CRBS for bearish signals
+                 Gate: ADX >= 30 (same routing as CRBS)
+      Status   : [x] COMPLETED 2026-05-24
+      Completed: Implemented in the same _execute_ratio_back_spread() method as CRBS.
+                 option_type="PE" → short_off=-1 (ATM-1 PE), long_off=-2 (ATM-2 PE).
+                 No separate code path required — direction fully parameterised.
+
+================================================================================
+RECOMMENDED BUILD ORDER
+================================================================================
+
+Week 1
+  Day 1-2  :  [1A] NR4 Filter + [1B] Inside Bar Gate + [1C] Engulfing S/R check
+  Day 3    :  [2D] Enhanced Candlestick Agent (Morning Star, Evening Star, 3-Inside)
+  Day 4    :  [2A] FlagBreakout Worker
+  Day 5    :  [2B] TriangleBreakout Worker
+
+Week 2
+  Day 1-2  :  [2C] HS_Pattern Worker
+  Day 3    :  [3A] PCR / Max Pain Filter
+  Day 4-5  :  [1D] Bull Spread Mode in execute()
+
+Later
+  [3B] MCX execution (after Dhan MCX security_id mapping confirmed)
+  [3C] Futures Basis Engine (after Week 2 complete)
+  [4A] Swing Agent (after live account activated)
+  [4B] FA Agent (standalone research tool, low urgency)
+
+================================================================================
+COMPLETED LOG
+================================================================================
+
+Date        Item   Description
+----------  -----  -------------------------------------------------------------
+2026-05-22  1A     is_nr4() added to indicators.py; NR4 gate wired into vwap_reclaim.py
+                   for RECLAIM/REJECTION signals (current or prior candle must be NR4).
+2026-05-22  1B     is_inside_bar() added to indicators.py; gate wired into vwap_reclaim.py
+                   (RECLAIM/REJECTION) and advanced_ema_orb.py (ORB breakout) — when prior
+                   candle is inside bar, current candle must break its range in signal direction.
+2026-05-22  1C     has_bullish_pattern() / has_bearish_pattern() in candlestick.py now accept
+                   optional ref_price + tolerance (0.3%); multi_strike_scalp.py passes VWAP
+                   as ref_price; candlestick_reversal.py already had 0.25% VWAP/EMA gate.
+2026-05-22  2A     strategies/flag_breakout.py: FlagBreakoutStrategy with _find_pole(),
+                   _validate_flag(), _detect(), _confidence(); detect_payload() primary
+                   interface; check_signal() compatibility wrapper. 8 tests passed.
+                   agents/flag_breakout_worker.py: FlagBreakoutWorker (worker Z) wrapping
+                   strategy; logs full payload on signal; registers on df_5m.
+2026-05-22  3A     agents/pcr_filter.py: PCRFilter daemon; NSE option-chain fetch at
+                   09:20 IST / every 30 min; PCR→bias; max pain via ITM minimisation;
+                   is_max_pain_blocked() expiry-day last-2h gate (100-pt band).
+                   data_agent.py: pcr_filter param; bias merge (5 rules).
+                   DhanOmniEngine_v2.py: PCRFilter wired as thread + singleton.
+                   DhanOmniEngine.py: max-pain gate in execute() before spread routing.
+2026-05-22  1D     core/order_placer.py: place_debit_spread() — BUY long then SELL short
+                   sequentially; aborts if long fails (no naked short exposure).
+                   DhanOmniEngine.py: _SPREAD_ADX_MIN=25.0; execute() computes ADX after
+                   spot fetch; routes to _execute_debit_spread() when ADX>=25, otherwise
+                   existing single-leg path. _execute_debit_spread(): finds OTM via
+                   get_atm_neighbors() atm_offset logic, places spread, paper-fallbacks
+                   per-leg, logs both to DB with spread_mode context.
+2026-05-22  2C     strategies/hs_pattern.py: HSPatternStrategy with _detect_hs_top(),
+                   _detect_inv_hs(); neckline = avg of inter-peak troughs / inter-trough
+                   peaks; shoulder symmetry gate |LS-RS|/head_height < 60%; scan most-
+                   recent triplet first; volume > 1.2x 10-bar average.
+                   agents/hs_pattern_worker.py: HSPatternWorker (worker AB) wrapping
+                   strategy; logs full payload on signal; operates on df_5m.
+                   Tests: H&S Top, Inv H&S, no-breakout, short-data, low-vol, symmetry.
+2026-05-22  2B     strategies/triangle_breakout.py: TriangleBreakoutStrategy with
+                   _try_ascending(), _try_descending(), _try_symmetrical(); OLS slope
+                   helpers (_positive_slope/_negative_slope); ADX>20 + volume>1.2× gates.
+                   agents/triangle_breakout_worker.py: TriangleBreakoutWorker (worker AA)
+                   wrapping strategy; logs full payload on signal; registers on df_5m.
+                   Smoke tests passed: slope detection, flatness check, worker import.
+2026-05-22  2D     candlestick.py: added is_morning_star(), is_evening_star(),
+                   is_three_inside_up(), is_three_inside_down(); aggregates updated.
+                   candlestick_reversal.py: check_signal() checks all 6 patterns;
+                   new detect_signal_payload() → {timestamp,index,pattern,direction,
+                   confidence,entry,sl,target}; confidence = 0.50 base + key-level
+                   +0.15 + volume +0.20 + 3-candle +0.10. MD file moved to Completed.
+2026-05-22  3B     core/mcx_lookup.py: MCXLookup — reads segment M FUTCOM MCX rows;
+                   get_front_month(symbol) → nearest contract {security_id,
+                   trading_symbol, expiry_date, lot_size=1, exchange_segment=MCX_COMM}.
+                   agents/mcx_worker.py: MCXWorker daemon — polls DXY from Stooq every
+                   5 min; EIA blackout ±30 min (CRUDEOIL Wed 22:00, NATGAS Thu 20:00
+                   IST); is_safe_to_trade() / is_cme_session() guards; singleton.
+                   dhan_tg_trader.py: MCX elif now executes — front-month lookup,
+                   EIA guard, CME log, falls through to place_market_order + DB insert.
+                   Workers Z/AA/AB wired into DhanOmniEngine_v2.py fan-out list.
+2026-05-22  3C     agents/futures_basis_worker.py: FuturesBasisWorker daemon —
+                   NIFTY FUTIDX front-month lookup (segment D NSE); basis + OI polling
+                   via get_market_quote(NSE_FNO) every 60s; 5-cycle OI delta tracking;
+                   constituent lead-lag: 10 BSE heavyweights via single get_market_quote
+                   call; emits BULLISH/BEARISH SignalEvent when >=3 moved >0.3% while
+                   index moved <0.15%; 15-min cooldown per direction. Wired as step 9g.
+2026-05-24  4A     Re-architected as Kite-powered paper trader (no live account needed).
+                   config/swing_universe.json: ~254 NSE symbols; core/swing_eod_store.py:
+                   Kite daily candles → swing_eod.db, 365-day seed (61,303 rows, 250 syms);
+                   strategies/swing_scanner.py: EMA_PULLBACK/NR4_COIL/HIGH_BREAKOUT;
+                   agents/swing_agent.py: daemon, 4 daily tasks + Saturday scan;
+                   swing_setup.py: one-time setup; dashboard Swing tab + /api/swing endpoint;
+                   start_trading_system.py: Swing Agent process added.
+2026-05-24  CRBS   core/strike_lookup.py: get_atm_option_offset(offset) for any ATM±N strike.
+                   core/order_placer.py: place_ratio_back_spread() — BUY 2x long first,
+                   SELL 1x short; safe order (no naked short if SELL fails).
+                   DhanOmniEngine.py: _RBS_ADX_MIN=30.0; 3-tier ADX routing in execute()
+                   (single-leg/debit-spread/RBS); _execute_ratio_back_spread() resolves
+                   ATM+1 short + ATM+2 long via get_atm_option_offset; fallback to debit
+                   spread if ATM+2 missing; logs both legs with spread_type="RBS".
+2026-05-24  PRBS   Same _execute_ratio_back_spread() as CRBS — option_type="PE" routes to
+                   ATM-1 short + ATM-2 long automatically. No separate code path.
+2026-05-24  BLAST  agents/expiry_blast_worker.py: ExpiryBlastWorker daemon; NIFTY expiry days
+                   only (Tuesdays); polls 1M candles 14:40-15:03 IST; pre-blast check 14:40-14:59
+                   (RSI/ATR/range5/VWAP/EMA/BB%); blast confirmation on 15:00 candle (body%,
+                   move vs ATR, RSI jump, BB%); calls engine.execute_expiry_blast(); 1 lot ATM CE;
+                   paper fallback SANDBOX_EXPBLAST_{ts}. Wired as step 9h in DhanOmniEngine_v2.py.
+2026-05-25  5A     core/fno_universe.py: FnoUniverse — 209 FnO underlyings from OPTSTK scrip master,
+                   207 mapped to NSE_EQ security_ids; get_fno_universe() singleton.
+                   core/baseline_store.py: BaselineStore — yfinance 1-year history; stores
+                   prev_close/vol20/atr14/high52w/low52w in anomaly_baselines; nightly refresh.
+                   agents/anomaly_scanner.py: AnomalyScanner daemon — Dhan batch quote_data(50/call);
+                   PRICE_UP/DOWN >2%, VOL_SPIKE >2×, COMBINED; anomaly_alerts table; thread 9j.
+                   dhan_dashboard.py: /api/anomalies endpoint. Dashboard: Anomalies tab.
+2026-05-25  5B     agents/risk_sentinel.py: RiskSentinel daemon — polls get_positions() every 5 min;
+                   flags non-FnO NSE_EQ holdings in risk_flags table; auto-clears on close;
+                   thread 9k. dhan_dashboard.py: /api/risk_flags. Dashboard: risk-flag panel.
+2026-05-24  AUDIT  Full codebase audit: all 22 tracker items (1A-4B, CRBS, PRBS) verified present
+                   and correctly structured. Added 5 undocumented live agents to Coverage Check:
+                   VIXStraddle (Ph22), IronCondor (Ph22), WeeklyStrangle (Ph23), RedDaySeller (Ph23),
+                   ExpiryBlast (NiftyBlast1). GammaBlast (Ph20) was already documented.
+2026-05-25  6C     core/equity_candle_store.py: equity_candles.db, equity_candles_1min table,
+                   fetch_today(NSE_EQ, interval=1), save/load/resample, _parse_dhan_response().
+                   agents/equity_candle_collector.py: EquityCandleCollector daemon (thread 9l);
+                   cycles 209 FnO stocks @ 0.4s, startup sweep, market hours 09:15-15:35.
+                   core/candle_patterns.py: 31 pure-pandas patterns (8 imported + 23 new);
+                   PATTERN_REGISTRY [(fn, name, direction, min_bars)] drives scanner.
+                   agents/pattern_scanner.py: PatternScanner daemon (thread 9m); pattern_alerts
+                   table UNIQUE(symbol,timeframe,pattern,candle_time); confidence 1-3;
+                   1M/5M every 5min, 1H every 60min, 4H every 4H.
+                   dhan_dashboard.py: /api/patterns. Dashboard: 🕯 Patterns tab.
+2026-05-25  6B     core/pa_engine.py: SwingPoint namedtuple; get_swings/classify_structure/
+                   get_structural_levels; detect_bos/detect_choch; detect_order_blocks
+                   (last bar before ≥0.8% impulse); detect_fvg (C1.high < C3.low gap);
+                   is_at_zone(0.5% tol); detect_pin_bar/engulfing/ib_breakout.
+                   agents/pa_scanner.py: PAScanner daemon (thread 9n); pa_zones + pa_setups
+                   tables in trading.db; 1H yfinance with 3600s TTL cache; 5M from
+                   equity_candles.db (resample) with yfinance fallback; zone-touch + 5M
+                   entry confirmation; confidence 1-3; SCAN_INTERVAL=300s.
+                   Fixed SQL bug: WHERE zone_low=? (was missing = sign).
+                   dhan_dashboard.py: /api/pa_setups (setups + zones + stats).
+                   Dashboard: 🔍 PA Setups tab (setup table + collapsible zones panel).
+2026-05-25  6A     core/mcx_candle_store.py: mcx_candles.db, mcx_candles_1min(+expiry_date),
+                   fetch_today(MCX_COMM, FUTCOM, interval=1), same save/load/resample pattern.
+                   agents/mcx_candle_collector.py: MCXCandleCollector daemon (part of thread 9o);
+                   5 instruments at 0.5s; MCXLookup daily front-month refresh; MCX hours 09:00-23:30.
+                   agents/commodity_brain.py: CommodityBrain daemon (part of thread 9o);
+                   commodity_signals table; 5 signals (EMA9/21, SuperTrend(7,3), VWAP±0.5%,
+                   ORB first-15min, DXY 6-reading deque); score ≥3 fires signal; 1.5×ATR stops;
+                   yfinance proxies (GC=F/SI=F/CL=F/NG=F/HG=F) as fallback — smoke test passed.
+                   MCXWorker singleton registered so CommodityBrain calls is_safe_to_trade().
+                   No new entries after 22:30 IST (overnight risk guard).
+                   dhan_dashboard.py: /api/commodities (signals + snapshot cards + stats).
+                   Dashboard: 🥇 Commodities tab (5 snapshot cards + signal table + footer).
+
+================================================================================
+MD FILE STATUS
+================================================================================
+
+File                                                    Status
+------------------------------------------------------  ------------------------
+index_trading_strategies.md                             MOVED TO Completed_Implementation (all strategies live)
+Nifty_Scalping_Strategies_Beginner_Guide.md             MOVED TO Completed_Implementation (all strategies live)
+strategy_analysis.md                                    MOVED TO Completed_Implementation (1A/1B/1C/1D/2A/2B/2C/3A all done)
+Candlestick Pattern Detection Agent (1M Multi-Index).md MOVED TO Completed_Implementation (2D done)
+Swing Trading Orchestration Agent.md                    COMPLETE — 4A done 2026-05-24 (Kite paper trader)
+Commodity Trading Brain Design.md                       MOVED TO Completed_Implementation (3B done; 6A extends it)
+Fundamental Analysis & Paper Portfolio Agent.md         MOVED TO Completed_Implementation (4B done 2026-05-24)
+Real-Time PriceVolume Anomaly Scanner & Portfolio Risk Engine.md  COMPLETE — done 2026-05-25 (5A+5B)
+System Architecture & Design Prompt.md                  MOVED TO Completed_Implementation (3C done)
+NEXT_PHASE_RESEARCH_25MAY2026.md                        COMPLETE — 6A+6B+6C all built 2026-05-25
+
+================================================================================
+END OF TRACKER
+================================================================================
