@@ -29,3 +29,4 @@ __pycache__/
 
 # Temp files
 _tmp_*.py
+cloudflared.exe
